@@ -394,7 +394,33 @@ class Refractive3dOptic:
         """Propagate the input field through each z-slice of the volume.
 
         I think doi.org/10.1364/AO.17.003990 is the OG reference for the
-        algorithm we're currently using here to simulate propagation.
+        'Beam Propagation Method' that we originally used to simulate
+        propagation, but the BPM isn't super accurate.
+
+        Fortunately, there's a much more accurate algorithm described in
+        doi.org/10.1364/AO.32.004984 : the 'Plane Wave Propagation
+        Method'. Unfortunately, the WPM is MUCH slower than the BPM, too
+        slow to use here.
+
+        Fortunately, doi.org/10.1364/OE.486296 describes a much faster
+        hybrd of the BPM and the WPM, called the HyPM. We don't use the
+        HyPM here, but we implemented something similar, inspired by the
+        HyPM, which (I believe) combines the speed of the BPM with the
+        accuracy of the WPM. I call this algorithm the Interpolated WPM.
+
+        Rather than directly simulate propagation through a single slice
+        of *inhomogenous* refractive index (which is very expensive), we
+        simulate propagation of the same input through several different
+        slices of *homogenous* refractive index. (So far, this is the
+        same approach that the HyPM uses). We use these homogenous-slice
+        results as a lookup table for simulating propagation through our
+        actual object: the output value at each pixel is a simple
+        interpolation between the two neareset values in the lookup
+        table.
+
+        Note that the number of reference slices to use is a tunable
+        parameter. Adjust the `_index_bin_size` attribute of this object
+        if you want a different tradeoff between speed and accuracy.
         """
         try:
             self._require('_composition_tensor', 'set_3d_concentration')
@@ -406,11 +432,6 @@ class Refractive3dOptic:
             self._require('input_field',         'set_2d_input_field')
         self._require('material_list', 'set_materials')
         self._require('wavelength',    'set_2d_input_field')
-        # How do amplitude and phase change from one slice to the next?
-        # Regardless of the optic, we want to propagate "between"
-        # slices as if we were in a homogenous medium with absorbing
-        # boundary conditions:
-        amplitude_mask = self._apodization_amplitude_mask()
         # Use Torch so we can calculate gradients:
         if not hasattr(self, '_composition_tensor'):
             # Note that this is a list of 2D tensors, not a 3D tensor
@@ -423,33 +444,38 @@ class Refractive3dOptic:
             self._input_field_tensor = self._to_torch(self.input_field)
         # Nicknames:
         fft, ifft, fftfreq = torch.fft.fftn, torch.fft.ifftn, torch.fft.fftfreq
-        exp, sqrt, pi = torch.exp, torch.sqrt, torch.pi
+        exp, sqrt, linspace = torch.exp, torch.sqrt, torch.linspace
+        pi, f64, c128 = torch.pi, torch.float64, torch.complex128
         k, d, linspace = 2*pi/self.wavelength, self.device, torch.linspace
         nx, ny, nz = self.coordinates.n_xyz
         dx, dy, dz = self.coordinates.d_xyz
+        # The FFT gives periodic boundary conditions, but we want
+        # absorbing boundary conditions. We use this mask to attenuate
+        # light that gets too close to the edge:
+        amplitude_mask = self._apodization_amplitude_mask()
         # Propagate the light through the optic, one slice at a time:
         calculated_field = [self._input_field_tensor]
-        kx = (2*pi/dx)*fftfreq(nx, device=d).reshape(1, 1, nx)
-        ky = (2*pi/dy)*fftfreq(ny, device=d).reshape(1, ny, 1)
-        kr_sq = kx**2 + ky**2
+        kx = (2*pi/dx)*fftfreq(nx, device=d, dtype=f64).reshape(1, 1, nx)
+        ky = (2*pi/dy)*fftfreq(ny, device=d, dtype=f64).reshape(1, ny, 1)
+        kr_sq = kx**2 + ky**2 # The transverse component of the k-vector
         for c in self._composition_tensor:
             # The composition is the quantity we ultimately want to
             # update via gradient search, so it `requires_grad`:
             c.requires_grad_(True)
-            # Convert the composition to phase shifts:
+            # Convert the composition to index of refraction:
             n = self._composition_to_refractive_index(c)
             # It's expensive to propagate in arbitrary inhomogenous
             # refractive indices, so instead, we'll simulate propagation in
             # a limited number of homogenous 'reference' materials:
             n_min, n_max = n.min(), n.max() + 1e-6
-            if not hasattr(self, '_index_bin_size'):
-                self._index_bin_size = 0.02
-            n_bins = max(2, int((n_max-n_min)/self._index_bin_size))
+            if not hasattr(self, '_refractive_index_bin_size'):
+                self._refractive_index_bin_size = 0.02
+            n_bins = max(2, int((n_max-n_min)/self._refractive_index_bin_size))
             reference_indices = linspace(n_min, n_max, n_bins,
-                                         device=d, dtype=torch.float64,
+                                         device=d, dtype=f64,
                                          ).reshape(n_bins, 1, 1)
             kz_sq = (k*reference_indices)**2 - kr_sq # Might be negative, so...
-            kz = sqrt(kz_sq.to(torch.complex128)) # complex in -> complex out
+            kz = sqrt(kz_sq.to(c128)) # complex input -> complex output
             # The i-th slice of this array represents the propagation
             # that would have happened, if our refractive object was
             # homogenous, with refractive index = `reference_indices[i]`
