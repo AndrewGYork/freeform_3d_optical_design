@@ -19,9 +19,10 @@ class in the `example_of_usage` string below.
 Written by Andrew G. York, licensed CC-BY 4.0.
 
 Inspired and informed by conversations with Shwetadwip Chowdhury, Tanner
-Fadero, Dakota Britton, and (presumably) others I'm forgetting. Credit
-them for what's good here, and blame me for what's bad. Please tell me
-if I should add your name to this list!
+Fadero, Dakota Britton, Jordão Bragantini, Gabriel (Gav) Sturm, Seth
+Hinz, Vincent Selhorst-Jones, Megan Fu, and (presumably) others I'm
+forgetting. Credit them for what's good here, and blame me for what's
+bad. Please tell me if I should add your name to this list!
 """
 
 ##############################################################################
