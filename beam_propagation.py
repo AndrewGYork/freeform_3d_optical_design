@@ -2,7 +2,7 @@ import numpy as np
 import torch # For calculating gradients
 
 """
-v1.0.6
+v1.0.7
 
 Techniques for fabricating freeform 3D refractive optics are rapidly
 maturing. By 'freeform', I don't just mean the shape - I mean optics
@@ -409,10 +409,8 @@ class Refractive3dOptic:
         # Regardless of the optic, we want to propagate "between"
         # slices as if we were in a homogenous medium with absorbing
         # boundary conditions:
-        phase_mask     = self._propagation_phase_mask(self.coordinates.dz)
         amplitude_mask = self._apodization_amplitude_mask()
         # Use Torch so we can calculate gradients:
-        fft, ifft, exp = torch.fft.fftn, torch.fft.ifftn, torch.exp
         if not hasattr(self, '_composition_tensor'):
             # Note that this is a list of 2D tensors, not a 3D tensor
             # like you might expect. I think this important for the
@@ -422,20 +420,48 @@ class Refractive3dOptic:
                                         for c in self.concentration]
         if not hasattr(self, '_input_field_tensor'):
             self._input_field_tensor = self._to_torch(self.input_field)
+        # Nicknames:
+        fft, ifft, fftfreq = torch.fft.fftn, torch.fft.ifftn, torch.fft.fftfreq
+        exp, sqrt, pi = torch.exp, torch.sqrt, torch.pi
+        k, d, linspace = 2*pi/self.wavelength, self.device, torch.linspace
+        nx, ny, nz = self.coordinates.n_xyz
+        dx, dy, dz = self.coordinates.d_xyz
         # Propagate the light through the optic, one slice at a time:
         calculated_field = [self._input_field_tensor]
+        kx = (2*pi/dx)*fftfreq(nx, device=d).reshape(1, 1, nx)
+        ky = (2*pi/dy)*fftfreq(ny, device=d).reshape(1, ny, 1)
+        kr_sq = kx**2 + ky**2
         for c in self._composition_tensor:
             # The composition is the quantity we ultimately want to
             # update via gradient search, so it `requires_grad`:
             c.requires_grad_(True)
             # Convert the composition to phase shifts:
-            phase_shifts = self._composition_to_phase_shifts(c)
-            # This step accounts for 99% of the computational burden of
-            # this entire module:
-            # fft, multiply, ifft, multiply
-            calculated_field.append(
-                amplitude_mask * exp(1j * phase_shifts) *
-                ifft(phase_mask * fft(calculated_field[-1])))
+            n = self._composition_to_refractive_index(c)
+            # It's expensive to propagate in arbitrary inhomogenous
+            # refractive indices, so instead, we'll simulate propagation in
+            # a limited number of homogenous 'reference' materials:
+            n_min, n_max = n.min(), n.max() + 1e-6
+            if not hasattr(self, '_index_bin_size'):
+                self._index_bin_size = 0.02
+            n_bins = max(2, int((n_max-n_min)/self._index_bin_size))
+            reference_indices = linspace(n_min, n_max, n_bins,
+                                         device=d, dtype=torch.float64,
+                                         ).reshape(n_bins, 1, 1)
+            kz_sq = (k*reference_indices)**2 - kr_sq # Might be negative, so...
+            kz = sqrt(kz_sq.to(torch.complex128)) # complex in -> complex out
+            # The i-th slice of this array represents the propagation
+            # that would have happened, if our refractive object was
+            # homogenous, with refractive index = `reference_indices[i]`
+            last_field_ft = fft(calculated_field[-1])
+            reference_fields = ifft(exp(1j*kz*dz) * last_field_ft,
+                                    dim=(1, 2))
+            # ...which we can use as a lookup table, to interpolate
+            # values for the (inhomogenous) refractive object we
+            # ACTUALLY have:
+            next_field = _z_interpolate(known_values=reference_fields,
+                                        known_z=reference_indices.squeeze(),
+                                        desired_z=n)
+            calculated_field.append(next_field*amplitude_mask)
         # Save results as attributes, not return values:
         self._calculated_field_tensor = calculated_field
         return None
@@ -560,37 +586,32 @@ class Refractive3dOptic:
                           linear_taper(ny).reshape(ny, 1))
         return amplitude_mask
 
-    def _composition_to_phase_shifts(self, composition):
-        """Convert our `composition` tensor to phase shifts at each voxel.
+    def _composition_to_refractive_index(self, composition):
+        """Convert our `composition` tensor to refractive index at each voxel.
 
-        The propagation simulation wants to know phase shifts at each
-        voxel due to our refractive optic, which depends on the
-        `composition` at each voxel, the materials that we're mixing, the
-        size of the voxel, and the wavelength of the propagating light.
+        The propagation simulation wants to know the index at each voxel
+        due to our refractive optic, which depends on the `composition`
+        at each voxel, and the materials that we're mixing.
         """
         # `composition` must be a tensor, to allow autograd:
         assert isinstance(composition, torch.Tensor)
-        # Local nicknames for the scalars:
-        dz, wavelength, pi = self.coordinates.dz, self.wavelength, np.pi
 
         # The index of refraction is a weighted average of our
         # materials. For now, we only implement binary mixtures:
         concentration = _to_concentration(composition)
-        self.index_list = [m.get_index(wavelength) for m in self.material_list]
+        self.index_list = [m.get_index(self.wavelength)
+                           for m in self.material_list]
         assert len(self.index_list) == 2
         index_1, index_2 = self.index_list
-        index_minus_1 = (index_1 - 1) + (index_2 - index_1)*concentration
-        
-        # The phase shift scales with dz and inversely with wavelength:
-        phase_shifts = 2*pi * dz * index_minus_1 / wavelength
-        
-        return phase_shifts # This is a pytorch Tensor (which allows autograd)
+        refractive_index = index_1 + (index_2 - index_1)*concentration
+                
+        return refractive_index # A pytorch Tensor (which allows autograd)
 
     def _freespace_propagation(self, field, distance):
         """
         Like `_calculate_3d_propagation()`, but for a single step, with
-        no edge absorption and no phase shifts. We use this internally
-        to calculate the loss function.
+        no edge absorption and homogenous refractive index. We use this
+        internally to calculate the loss function.
         """
         nx, ny, nz = self.coordinates.n_xyz
         assert field.shape == (ny, nx)
@@ -683,6 +704,45 @@ def _to_composition(concentration):
     concentration = clip(concentration, eps, 1-eps)
     composition = tan(np.pi*(concentration - 0.5))
     return composition
+
+def _z_interpolate(known_values, known_z, desired_z):
+    """Interpolate a 3D stack in the z-direction.
+    """
+    # 'known_values' is a 3D stack of 2D images, each taken at some
+    # fixed, known z-coordinate. At each xy position in 2D, we want to
+    # interpolate in the z-direction, to give a value at an unknown,
+    # intermediate z-coordinate:
+    assert known_values.ndim == 3
+    num_values, ny, nx = known_values.shape
+    num_intervals = num_values - 1
+    assert num_intervals >= 1
+    # 'known_z' is a 1D vector, giving the z-coordinate of each 2D image
+    # in 'known_values'. 'known_z' must be monotonic increasing, and
+    # uniformly spaced:
+    assert known_z.shape == (num_values,)
+    zi, zf = known_z[0], known_z[-1]
+    uniformly_spaced_values = torch.linspace(
+        zi, zf, num_values, device=known_z.device, dtype=known_z.dtype)
+    assert torch.allclose(known_z, uniformly_spaced_values)
+    # 'desired_z' is a 2D array, with the same dimensions as a single
+    # slice of 'known_values'. The entries in 'desired_z' are the
+    # (unknown) z-coordinates at which we want to estimate values via
+    # interpolation. All these z-values must be within the interval
+    # covered by 'known_z':
+    assert desired_z.shape == (ny, nx)
+    assert zi <= desired_z.min() 
+    assert desired_z.max() < zf
+    
+    desired_z_normalized = (desired_z - zi) * (num_intervals / (zf - zi))
+    which_interval = torch.floor(desired_z_normalized)
+    remainder = desired_z_normalized - which_interval
+    which_interval = which_interval.to(torch.int64).reshape(1, ny, nx)
+
+    lo_bound_vals = torch.gather(known_values, 0, which_interval)
+    hi_bound_vals = torch.gather(known_values, 0, which_interval+1)
+
+    result = lo_bound_vals*(1-remainder) + hi_bound_vals*remainder
+    return result[0, :, :]
 
 def smooth_2d(a, sigma=5):
     """Smooth a 2D torch tensor via convolution with a small Gaussian kernel
