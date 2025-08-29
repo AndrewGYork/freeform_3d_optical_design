@@ -419,8 +419,9 @@ class Refractive3dOptic:
         table.
 
         Note that the number of reference slices to use is a tunable
-        parameter. Adjust the `_index_bin_size` attribute of this object
-        if you want a different tradeoff between speed and accuracy.
+        parameter. Adjust the `_refractive_index_bin_size` attribute of
+        this object if you want a different tradeoff between speed and
+        accuracy.
         """
         try:
             self._require('_composition_tensor', 'set_3d_concentration')
@@ -1020,6 +1021,8 @@ def to_tif(filename, x):
     import tifffile as tf
     if hasattr(x, 'detach'):
         x = x.detach()
+    if hasattr(x, 'cpu'):
+        x = x.cpu()
     x = np.asarray(x).real.astype('float32')
     if x.ndim == 3:
         x = np.expand_dims(x, axis=(0, 2))
