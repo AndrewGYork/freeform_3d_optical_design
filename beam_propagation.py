@@ -2,7 +2,7 @@ import numpy as np
 import torch # For calculating gradients
 
 """
-v1.0.7
+v1.0.0
 
 Techniques for fabricating freeform 3D refractive optics are rapidly
 maturing. By 'freeform', I don't just mean the shape - I mean optics
@@ -35,14 +35,13 @@ bad. Please tell me if I should add your name to this list!
 ## this as your starting point for learning to use the module.
 ##
 ##############################################################################
-
 example_of_usage = """import time
 import numpy as np
 from beam_propagation import (
     Coordinates, Refractive3dOptic, FixedIndexMaterial,
-    TrainingData_for_2dImaging, from_tif, to_tif, plot_loss_history)
+    TrainingData_for_2dImaging, from_tif, to_tif, plot_loss_history, show_ray_diagram, show_ray_bundle)
 
-def example_of_usage():
+def example_of_usage(): 
     \"""Example code: design a 3D refractive optic with specified input/output.
 
     Consider copy-pasting this example code to get you started.
@@ -62,9 +61,9 @@ def example_of_usage():
     \"""
 
     # Specify our coordinate system, organized via a Coordinates object:
-    coords = Coordinates(xyz_i=(-12.7, -12.7,     0),
-                         xyz_f=(+12.7, +12.7, +25.4),
-                         n_xyz=(  128,   128,   128))
+    coords = Coordinates(xyz_i=(-12.7, -12.7,  0    ),
+                         xyz_f=(+12.7, +12.7, +25.4 ),
+                         n_xyz=(  128,   128,   128 ))
     print("Voxel dimensions: %0.3f, %0.3f, %0.3f"%(coords.d_xyz))
 
     # Use these coordinates to initialize an instance of Refractive3dOptic
@@ -73,9 +72,9 @@ def example_of_usage():
     ro = Refractive3dOptic(coords)
 
     # Each voxel of our refractive optic is a mixture of materials:
-    air     = FixedIndexMaterial(1)
-    polymer = FixedIndexMaterial(1.5)
-    ro.set_materials((air, polymer))
+    mat_low = FixedIndexMaterial(0.5)
+    mat_high = FixedIndexMaterial(2.5)
+    ro.set_materials((mat_low, mat_high))
 
     # Initialize our optic.
     try: # If there's a concentration saved to disk, pick up where we left off:
@@ -84,32 +83,37 @@ def example_of_usage():
         ro.set_3d_concentration(initial_concentration)
         print("Using initial concentration from:", fname)
     except FileNotFoundError:
-        print("Using default concentration (50/50 mixture at each voxel).")
+        initial_concentration = maxwell_fisheye(coords, mat_high, mat_low)
+        ro.set_3d_concentration(initial_concentration)
+        print("Using default concentration (Maxwell's Fisheye).")
 
     # Make a source to generate training data. In this case, the
     # training data is for a simple plane-to-plane inverting imaging
     # system:
-    data_source = TrainingData_for_2dImaging(coords, radius=3)
+    data_source = TrainingData_for_2dImaging(coords, radius=5)
 
     wavelength = 1
-    divergence_angle_degrees = 15
+    divergence_angle_degrees = 20
     loss_history = []
     for iteration in range(int(1e6)): # Run for a loooong time
         start_time = time.perf_counter()
         
         # Use our data source to generate random input/output pairs:
         x0, y0 = data_source.random_point_in_a_circle()
-        input_field, desired_output_field = data_source.input_output_pair(
-            x0, y0, wavelength, divergence_angle_degrees)
-        ro.set_2d_input_field(input_field, wavelength)
-        ro.set_2d_desired_output_field(desired_output_field)
+        num_thetas = 40
+        num_phis = 40
+        input_raybundle, desired_output_raybundle = data_source.input_output_pair(
+            x0, y0, wavelength, num_thetas, num_phis, divergence_angle_degrees)
+        ro.set_input_raybundle(input_raybundle, wavelength)
+        ro.set_desired_output_raybundle(desired_output_raybundle)
+        show_ray_bundle(coords, input_raybundle, "input")
+        show_ray_bundle(coords, desired_output_raybundle, "desired_output")
 
         # Simulate propagation through our 3D refractive optic,
         # calculate loss, and calculate a gradient that hopefully will
         # reduce the loss:
         ro.gradient_update(
-            step_size=100,
-            z_planes=(1, 2, 3),
+            step_size=1e-2,
             smoothing_sigma=5)
         loss_history.append((x0, y0, ro.loss))
 
@@ -126,22 +130,45 @@ def example_of_usage():
             to_tif('00_composition.tif',          ro.composition)
             to_tif('01_concentration.tif',        ro.concentration)
             to_tif('02_concentration_xz.tif',
-                   ro.concentration[:, ro.coordinates.ny//2, :])
-            to_tif('03_input_field.tif',          ro.input_field)
-            to_tif('04_desired_output_field.tif', ro.desired_output_field)
-            to_tif('05_calculated_field.tif',
-                   np.abs(ro.calculated_field))
-            to_tif('06_desired_output_field_3d',
-                   np.abs(ro.desired_output_field_3d))
-            to_tif('07_calculated_output_field_3d',
-                   np.abs(ro.calculated_output_field_3d))
-            to_tif('08_error_3d.tif', ro.error_3d)
-            to_tif('09_gradient.tif', ro.gradient)
-            plot_loss_history(loss_history, '10_loss_history.png')
+                   ro.concentration[:, ro.coordinates.ny//2, :].transpose())
+            show_ray_diagram(coords, ro.calculated_raybundle_sequence, '03_raybundle_sequence.png')
+            to_tif('04_gradient.tif', ro.gradient)
+            plot_loss_history(loss_history, '05_loss_history.png')
             print("done.")
+
+def maxwell_fisheye(coords: Coordinates, high_ri_material: FixedIndexMaterial, low_ri_material: FixedIndexMaterial, center: tuple[float, float, float]=None, radius: float=None):
+    \"""Design a Maxwell fisheye (Luneberg lens) using the specified materials.\"""
+    # Calculate the radius of the lens
+    n_high = high_ri_material.index
+    n_low = low_ri_material.index
+    assert n_high > n_low, "High index material must have a higher index than low index material."
+    assert n_high / n_low >= 2, "Index ratio must be at least 2."
+    
+    Dx = coords.x_f - coords.x_i + coords.dx
+    Dy = coords.y_f - coords.y_i + coords.dy
+    Dz = coords.z_f - coords.z_i + coords.dz
+    
+    R = min(Dx/2, Dy/2, Dz/2) if radius is None else radius
+    
+    x, y, z = coords.xyz
+    if center is None:
+        center = (np.mean(x), np.mean(y), np.mean(z))
+    
+    x = x - center[0]
+    y = y - center[1]
+    z = z - center[2]
+    xyz = np.meshgrid(z, x, y, indexing='ij') # Note: meshgrid swaps y and z
+    
+    r = np.sqrt(xyz[0]**2 + xyz[1]**2 + xyz[2]**2)
+    n = np.clip(n_high / (1 + (r / R)**2), a_min=max(n_low, n_high/2), a_max=None)
+
+    concentration = (n - n_low) / (n_high - n_low) # Convert refractive index to concentration
+    
+    return concentration
 
 if __name__ == '__main__':
     example_of_usage()
+
 """
 
 ##############################################################################
@@ -204,8 +231,8 @@ class Refractive3dOptic:
             assert hasattr(m, 'get_index')
         self.material_list = material_list
         self._invalidate(( # Remove these attributes, if they exist:
-            'calculated_field', 'calculated_output_field_3d',
-            'desired_output_field_3d', 'error_3d', 'loss', 'gradient'))
+            'calculated_raybundle_sequence', 'calculated_output_raybundle_3d',
+            'desired_output_raybundle_3d', 'error_3d', 'loss', 'gradient'))
         return None
 
     def set_3d_concentration(self, concentration=None):
@@ -230,8 +257,8 @@ class Refractive3dOptic:
         assert np.isrealobj(concentration)
         self.concentration = concentration.astype('float64', copy=True)
         self._invalidate(( # Remove these attributes, if they exist:
-            'composition', 'calculated_field', 'calculated_output_field_3d',
-            'desired_output_field_3d', 'error_3d', 'loss', 'gradient'))
+            'composition', 'calculated_raybundle_sequence', 'calculated_output_raybundle_3d',
+            'desired_output_raybundle_3d', 'error_3d', 'loss', 'gradient'))
         return None
 
     def _set_3d_composition(self, composition):
@@ -249,30 +276,23 @@ class Refractive3dOptic:
         concentration = _to_concentration(composition)
         self.set_3d_concentration(concentration)
         return None
+    
+    def set_input_raybundle(self, input_raybundle, wavelength):
+        """What rays are we shining on our refractive optic?
 
-    def set_2d_input_field(self, input_field, wavelength):
-        """What light are we shining on our refractive optic?
-
-        `input_field` is a 2D numpy array of complex numbers, specifying
-        the amplitude and phase of the input light vs. 2D position at
-        the input plane of our refractive optic.
-
-        `wavelength` is a positive number in the same units as our
+        `input_raybundle` is a RayBundle object, specifying the positions
+        and directions of rays at the input plane of our refractive optic.
+        
+        `wavelength` is a positive number in the same units as our 
         Coordinates object (e.g. microns). Note that we're specifying
-        the wavelength of light our input field in *vacuum*, not in our
-        base material. This is used to calculate how the light spreads
-        out as it propagates through each layer of our refractive
-        optic, and also used to convert composition to index of refraction.
-
+        the wavelength of light our input rays in *vacuum*, not in our
+        base material. This is used to convert composition to index of
+        refraction.
+        
         If you're simulating dispersion using a SellmeierMaterial, then
         the units of `wavelength` need to be microns.
         """
         self._require('material_list', 'set_materials')
-        nx, ny, nz = self.coordinates.n_xyz
-        assert input_field.shape == (ny, nx)
-        assert (isinstance(input_field, np.ndarray) or
-                isinstance(input_field, torch.Tensor))
-        assert input_field.dtype in ('complex128', torch.complex128)
         assert wavelength > 0
         warning_string = ("""
     You're using a SellmeierMaterial, which expects the units of
@@ -284,39 +304,31 @@ class Refractive3dOptic:
                 if not hasattr(self, '_SellmeierMaterial_warning'):
                     print(warning_string)
                     self._SellmeierMaterial_warning = True
-        self._invalidate(('input_field',)) # Deletes both array and tensor
-        if isinstance(input_field, np.ndarray):
-            self.input_field = input_field
-        elif isinstance(input_field, torch.Tensor):
-            self._input_field_tensor = input_field
+        assert isinstance(input_raybundle, RayBundle)
+        self._invalidate(('input_raybundle',)) # Deletes both array and tensor
+        self.input_raybundle = input_raybundle
         self.wavelength = wavelength
         self._invalidate(( # Remove these attributes, if they exist:
-            'desired_output_field', 'calculated_field',
-            'calculated_output_field_3d', 'desired_output_field_3d',
-            'error_3d', 'loss', 'gradient'))
+            'desired_output_raybundle', 'calculated_raybundle_sequence', 'error', 'loss', 'gradient'))
         return None
+    
+    def set_desired_output_raybundle(self, desired_output_raybundle):
+        """What rays do we wish would exit our refractive optic?
 
-    def set_2d_desired_output_field(self, desired_output_field):
-        """What light do we wish would exit our refractive optic?
-
-        `desired_output_field` is a 2D numpy array of complex numbers,
-        specifying the amplitude and phase of the light vs. 2D position
-        that we WISH would be produced at the output plane of our
+        `desired_output_raybundle` is a RayBundle object, specifying the
+        positions and directions of rays at the output plane of our
         refractive optic. We use this to calculate loss (aggregate
-        error between desired and calculated fields), and we take
+        error between desired and calculated raybundles), and we take
         gradients of this loss to update our optic to (hopefully) get
         closer to yielding our desired output.
         """
-        self._require('wavelength', 'set_2d_input_field')
-        nx, ny, nz = self.coordinates.n_xyz
-        assert desired_output_field.shape == (ny, nx)
-        assert desired_output_field.dtype == 'complex128'
-        self.desired_output_field = desired_output_field
+        assert isinstance(desired_output_raybundle, RayBundle)
+        self.desired_output_raybundle = desired_output_raybundle
         self._invalidate(( # Remove these attributes, if they exist:
-            'desired_output_field_3d', 'error_3d', 'loss', 'gradient'))
+            'calculated_raybundle_sequence', 'error', 'loss', 'gradient'))
         return None
 
-    def gradient_update(self, step_size, z_planes=(1, 2, 3), smoothing_sigma=5):
+    def gradient_update(self, step_size, smoothing_sigma=5):
         """Update our optic to get closer to our desired behavior.
 
         This is multiple steps rolled into one:
@@ -338,25 +350,25 @@ class Refractive3dOptic:
         assert smoothing_sigma >= 0
         step_size = float(step_size)
         smoothing_sigma = float(smoothing_sigma)
-        z_planes = [float(z) for z in z_planes]
         # These steps involve pytorch tensors, possibly on the GPU. I
         # find these more annoying to interact with than numpy arrays,
         # but copying to and from the GPU is expensive, so we stay
         # entirely in torch for these steps:        
-        self._calculate_3d_field()
-        self._calculate_loss(z_planes=z_planes)
+        self._calculate_3d_raybundle_sequence()
+        self._calculate_loss()
         self._calculate_gradient()
         # The gradient usually has high-spatial-frequency content that
         # isn't desirable or manufacturable, so we update our refractive
         # optic with a scaled, smoothed version of the gradient:
-        for g, c in zip(self._gradient_tensor, self._composition_tensor):
-            update = step_size * smooth_2d(g, sigma=smoothing_sigma)
-            c.requires_grad_(False)
-            c.subtract_(update)
+        g = self._gradient_tensor
+        c = self._composition_tensor
+        update = step_size * smooth_3d(g, sigma=smoothing_sigma)
+        c.requires_grad_(False)
+        c.subtract_(update)
 
         self._invalidate( # Most of our numpy attributes become invalid.
-            ('composition', 'concentration', 'calculated_field',
-             'desired_output_field_3d', 'calculated_output_field_3d',
+            ('composition', 'concentration', 'calculated_raybundle_sequence',
+             'desired_output_raybundle', 'calculated_output_raybundle',
              'error_3d', 'gradient'),
             # ...but the corresponding tensor attributes are still ok:
             also_invalidate_tensors=False)
@@ -374,245 +386,164 @@ class Refractive3dOptic:
         example.
         """
         for numpy_name in ('composition',
-                           'input_field',
-                           'calculated_field',
-                           'desired_output_field_3d',
-                           'calculated_output_field_3d',
+                           'input_raybundle',
+                           'calculated_raybundle_sequence',
+                           'desired_output_raybundle',
+                           'calculated_output_raybundle',
                            'error_3d',
                            'gradient'):
             torch_name = '_' + numpy_name + '_tensor'
             if hasattr(self, torch_name):
                 tensor = getattr(self, torch_name)
-                setattr(self, numpy_name, self._to_numpy(tensor))
+                if isinstance(tensor, RayBundle) or (isinstance(tensor, list) and isinstance(tensor[0], RayBundle)):
+                    setattr(self, numpy_name, self._to_numpy_raybundle(tensor))
+                else: 
+                    setattr(self, numpy_name, self._to_numpy(tensor))
                 if delete_tensors:
                     delattr(self, torch_name)
         if hasattr(self, 'composition'):
             self.concentration = _to_concentration(self.composition)
         return None
+    
+    def _get_acceleration(self, acceleration, xyz):
+        """Estimate acceleration at arbitrary xyz positions via interpolation.
+        """
+        assert xyz.device == acceleration.device
+        c, a_xyz = self.coordinates, acceleration
+        # The 3D interpolation routine in torch wants xyz scaled to the
+        # range (-1, 1). This is a little silly, but whatever:
+        xyz_i = torch.tensor(c.xyz_i, device=acceleration.device)
+        xyz_f = torch.tensor(c.xyz_f, device=acceleration.device)
+        center_point = 0.5*(xyz_f + xyz_i)
+        radius       = 0.5*(xyz_f - xyz_i)
+        xyz_scaled = (xyz - center_point) * (1/radius)
+        # The 3D interpolation routine in torch wants `xyz` and
+        # `acceleration` to have a few extra dimensions that we're not
+        # using. This is a little silly, but whatever:
+        xyz_scaled = xyz_scaled.reshape((1, 1, 1,) + xyz.shape)
+        a_xyz = a_xyz.reshape((1,) + a_xyz.shape)
+        # Now we can interpolate, and strip off the extra dimensions:
+        a_interpolated = torch.nn.functional.grid_sample(
+            a_xyz, xyz_scaled, mode='bilinear', align_corners=True
+            ).reshape(3, xyz.shape[0])
+        # The interpolation routine wants acceleration shaped (3, nz,
+        # ny, nx), and gives output shaped (3, num_rays), but we want
+        # our output shaped (nrays, 3):
+        a_interpolated = torch.transpose(a_interpolated, 0, 1)
+        return a_interpolated
+    
+    def _step_rays(self, raybundle, acceleration, dt):
+        """Step a raybundle forward by time interval dt"""
+        # Shorter nicknames
+        xyz, v_xyz, a = raybundle.xyz, raybundle.v_xyz, lambda xyz: self._get_acceleration(acceleration, xyz)
+        # Calculate A, B, C, for Sharma's algorithm:
+        A = dt * a(xyz)
+        B = dt * a(xyz + (1/2)*dt*v_xyz + (1/8)*dt*A)
+        C = dt * a(xyz +       dt*v_xyz + (1/2)*dt*B)
+        # Calculate the position/velocity update for Sharma's algorithm:
+        xyz_f = xyz + dt*(v_xyz + (1/6)*(A + 2*B))
+        v_xyz_f = v_xyz + (1/6)*(A + 4*B + C)
+        return RayBundle(xyz_f, v_xyz_f)
 
-    def _calculate_3d_field(self):
-        """Propagate the input field through each z-slice of the volume.
-
-        I think doi.org/10.1364/AO.17.003990 is the OG reference for the
-        'Beam Propagation Method' that we originally used to simulate
-        propagation, but the BPM isn't super accurate.
-
-        Fortunately, there's a much more accurate algorithm described in
-        doi.org/10.1364/AO.32.004984 : the 'Plane Wave Propagation
-        Method'. Unfortunately, the WPM is MUCH slower than the BPM, too
-        slow to use here.
-
-        Fortunately, doi.org/10.1364/OE.486296 describes a much faster
-        hybrd of the BPM and the WPM, called the HyPM. We don't use the
-        HyPM here, but we implemented something similar, inspired by the
-        HyPM, which (I believe) combines the speed of the BPM with the
-        accuracy of the WPM. I call this algorithm the Interpolated WPM.
-
-        Rather than directly simulate propagation through a single slice
-        of *inhomogenous* refractive index (which is very expensive), we
-        simulate propagation of the same input through several different
-        slices of *homogenous* refractive index. (So far, this is the
-        same approach that the HyPM uses). We use these homogenous-slice
-        results as a lookup table for simulating propagation through our
-        actual object: the output value at each pixel is a simple
-        interpolation between the two neareset values in the lookup
-        table.
-
-        Note that the number of reference slices to use is a tunable
-        parameter. Adjust the `_refractive_index_bin_size` attribute of
-        this object if you want a different tradeoff between speed and
-        accuracy.
+    def _calculate_3d_raybundle_sequence(self):
+        """Propagate our input raybundle through our 3D refractive optic 
+        using Runge-Kutta ray tracing.
+        
+        See Sharma (1982) for details of the algorithm ( doi.org/10.1364/AO.21.000984 )
         """
         try:
             self._require('_composition_tensor', 'set_3d_concentration')
         except AttributeError:
             self._require('concentration',       'set_3d_concentration')
         try:
-            self._require('_input_field_tensor', 'set_2d_input_field')
+            self._require('_input_raybundle_tensor', 'set_2d_input_raybundle')
         except AttributeError:
-            self._require('input_field',         'set_2d_input_field')
+            self._require('input_raybundle',         'set_2d_input_raybundle')
         self._require('material_list', 'set_materials')
-        self._require('wavelength',    'set_2d_input_field')
         # Use Torch so we can calculate gradients:
         if not hasattr(self, '_composition_tensor'):
-            # Note that this is a list of 2D tensors, not a 3D tensor
-            # like you might expect. I think this important for the
-            # performance of backpropagation, but maybe I just don't
-            # understand pytorch:
-            self._composition_tensor = [_to_composition(self._to_torch(c))
-                                        for c in self.concentration]
-        if not hasattr(self, '_input_field_tensor'):
-            self._input_field_tensor = self._to_torch(self.input_field)
+            self._composition_tensor = self._to_3d_torch(_to_composition(self.concentration))
+        if not hasattr(self, '_input_raybundle_tensor'):
+            self._input_raybundle_tensor = self._to_torch_raybundle(self.input_raybundle)
+        self._composition_tensor.requires_grad_(True)            
         # Nicknames:
-        fft, ifft, fftfreq = torch.fft.fftn, torch.fft.ifftn, torch.fft.fftfreq
-        exp, sqrt, linspace = torch.exp, torch.sqrt, torch.linspace
-        pi, f64, c128 = torch.pi, torch.float64, torch.complex128
-        k, d, linspace = 2*pi/self.wavelength, self.device, torch.linspace
+        x, y, z = self.coordinates.xyz
         nx, ny, nz = self.coordinates.n_xyz
         dx, dy, dz = self.coordinates.d_xyz
-        # The FFT gives periodic boundary conditions, but we want
-        # absorbing boundary conditions. We use this mask to attenuate
-        # light that gets too close to the edge:
-        amplitude_mask = self._apodization_amplitude_mask()
+        x_f, y_f, z_f = self.coordinates.xyz_f
+        # Parameters
+        dt = dz/5 # Step size for propagation; smaller = more accurate
+        max_steps = int(20*nz*dz/dt) # Max steps in case of total internal reflection 
+        # Calculate acceleration
+        acceleration = self._composition_to_acceleration(self._composition_tensor)
         # Propagate the light through the optic, one slice at a time:
-        calculated_field = [self._input_field_tensor]
-        kx = (2*pi/dx)*fftfreq(nx, device=d, dtype=f64).reshape(1, 1, nx)
-        ky = (2*pi/dy)*fftfreq(ny, device=d, dtype=f64).reshape(1, ny, 1)
-        kr_sq = kx**2 + ky**2 # The transverse component of the k-vector
-        for c in self._composition_tensor:
-            # The composition is the quantity we ultimately want to
-            # update via gradient search, so it `requires_grad`:
-            c.requires_grad_(True)
-            # Convert the composition to index of refraction:
-            n = self._composition_to_refractive_index(c)
-            # It's expensive to propagate in arbitrary inhomogenous
-            # refractive indices, so instead, we'll simulate propagation in
-            # a limited number of homogenous 'reference' materials:
-            n_min, n_max = n.min(), n.max() + 1e-6
-            if not hasattr(self, '_refractive_index_bin_size'):
-                self._refractive_index_bin_size = 0.02
-            n_bins = max(2, int((n_max-n_min)/self._refractive_index_bin_size))
-            reference_indices = linspace(n_min, n_max, n_bins,
-                                         device=d, dtype=f64,
-                                         ).reshape(n_bins, 1, 1)
-            kz_sq = (k*reference_indices)**2 - kr_sq # Might be negative, so...
-            kz = sqrt(kz_sq.to(c128)) # complex input -> complex output
-            # The i-th slice of this array represents the propagation
-            # that would have happened, if our refractive object was
-            # homogenous, with refractive index = `reference_indices[i]`
-            last_field_ft = fft(calculated_field[-1])
-            reference_fields = ifft(exp(1j*kz*dz) * last_field_ft,
-                                    dim=(1, 2))
-            # ...which we can use as a lookup table, to interpolate
-            # values for the (inhomogenous) refractive object we
-            # ACTUALLY have:
-            next_field = _z_interpolate(known_values=reference_fields,
-                                        known_z=reference_indices.squeeze(),
-                                        desired_z=n)
-            calculated_field.append(next_field*amplitude_mask)
-        # Save results as attributes, not return values:
-        self._calculated_field_tensor = calculated_field
-        return None
+        num_rays = self._input_raybundle_tensor.xyz.shape[0]
+        raybundle_sequence = [self._input_raybundle_tensor]
+        for which_step in range(max_steps):
+            # Get the current raybundle:
+            rb = raybundle_sequence[-1]
+            z_min  = rb.xyz[:, 2].min()
+            if (z_min - z_f)*dz > 0: # Trying to account for z_f < z_i
+                break
+            raybundle_sequence.append(self._step_rays(rb, acceleration, dt))
+        else:
+            print("After %d steps, not all rays have reached z=%0.2f"%(
+                max_steps, z_f))
+            print("If you need to propagate for longer, increase `max_steps`")
+        # Resample our trajectories onto the z-positions of our
+        # coordinate grid. I'm being lazy about this, because there
+        # aren't great interpolation functions in pytorch.
+        #  Variables sample uniformly in t:
+        xyz_vs_t   = torch.stack([rb.xyz   for rb in raybundle_sequence], dim=1)
+        v_xyz_vs_t = torch.stack([rb.v_xyz for rb in raybundle_sequence], dim=1)
+        #  Variables sampled uniformly in z:
+        c_z = torch.from_numpy(z).to(xyz_vs_t.device)
+        c_z = c_z.reshape(1, nz, 1).broadcast_to((num_rays, nz, 3))
+        z_vs_t = xyz_vs_t[:, :, 2:3].broadcast_to(xyz_vs_t.shape)
+        xyz_vs_z   = interp(x=c_z, xp=z_vs_t, fp=xyz_vs_t,   dim=1)
+        v_xyz_vs_z = interp(x=c_z, xp=z_vs_t, fp=v_xyz_vs_t, dim=1)
+        # Convert per-z positions and velocities back into an array of RayBundle objects
+        raybundle_sequence_tensor = [
+            RayBundle(xyz_vs_z[:, i, :], v_xyz_vs_z[:, i, :])
+            for i in range(nz)
+        ]
+        self._calculated_raybundle_sequence_tensor = raybundle_sequence_tensor
 
-    def _calculate_loss(self, z_planes=(1, 2, 3)):
-        """How well does our calculated field match our desired field?
-
-        `z_planes` is a list of z-offsets (in the same units as our
-        `Coordinates` object, relative to the output plane of our 3D
-        refractive optic) at which we'll calculate the intensity
-        mismatch between our calculated field and our desired field.
-
-        This 3D intensity-only penalty is a convenient way to penalize
-        erros in both position (intensity) and direction (phase) of our
-        calculated field, without ever directly referring to phase. In
-        my hands, it works better than any 2D penalty that refers
-        directly to both intensity and phase.
+    def _calculate_loss(self):
+        """How well does our calculated raybundle match our desired raybundle?
         """
-        self._require('desired_output_field', 'set_2d_desired_output_field')
-        self._require('_calculated_field_tensor', '_calculate_3d_field')
+        self._require('desired_output_raybundle', 'set_2d_desired_output_raybundle')
+        self._require('_calculated_raybundle_sequence_tensor', '_calculate_3d_raybundle_sequence')
         # We want gradients, so we'll calculate our loss using Torch:
-        desired_output_field = self._to_torch(self.desired_output_field)
-        calculated_output_field = self._calculated_field_tensor[-1]
-        # Since our fields are complex, we have to decide how to
-        # penalize both intensity and phase errors. My favorite way to
-        # do this is to simulate propagation in free space for both the
-        # calculated and the desired fields, and compare the intensity
-        # mismatch at multiple different z-planes.
-        # These are lists of 2D tensors:
-        desired_output_field_3d    = [desired_output_field]
-        calculated_output_field_3d = [calculated_output_field]
-        for dz in z_planes:
-            d_at_dz = self._freespace_propagation(desired_output_field,    dz)
-            c_at_dz = self._freespace_propagation(calculated_output_field, dz)
-            desired_output_field_3d.append(   d_at_dz)
-            calculated_output_field_3d.append(c_at_dz)
-
-        loss = torch.zeros(1, device=self.device, dtype=torch.float64)
-        error_3d = [] # Useful for visualization
-        for d, c in zip(desired_output_field_3d, calculated_output_field_3d):
-            desired_intensity    = d.abs()**2
-            calculated_intensity = c.abs()**2
-            intensity_error = (calculated_intensity - desired_intensity)
-            error_3d.append(intensity_error)
-            worst_case_intensity_error = (desired_intensity +
-                                          calculated_intensity).sum()
-            loss += intensity_error.abs().sum() / worst_case_intensity_error
-        loss = loss / (len(z_planes) + 1)
+        desired_output_raybundle = self._to_torch_raybundle(self.desired_output_raybundle)
+        calculated_output_raybundle = self._calculated_raybundle_sequence_tensor[-1]
+        # Error vectors:
+        error_xyz = calculated_output_raybundle.xyz - desired_output_raybundle.xyz
+        error_v_xyz = calculated_output_raybundle.v_xyz - desired_output_raybundle.v_xyz
+        # Calculate loss to be sum of euclidean distance for both the final ray position and
+        # velocity vectors. Euclidean distance was chosen over squared euclidean distance so
+        # that convergence does not slow down over time, and to improve stability for far rays.
+        loss_xyz = (error_xyz**2).sum(dim=1).sqrt().sum() 
+        loss_v_xyz = (error_v_xyz**2).sum(dim=1).sqrt().sum()
+        # Note that we may want to add an optical path delay term and loss term weight hyperparameters
+        # in the future.
         # Save our results as attributes, not return values:
-        self._desired_output_field_3d_tensor = desired_output_field_3d
-        self._calculated_output_field_3d_tensor = calculated_output_field_3d
-        self._error_3d_tensor = error_3d
-        self._loss_tensor = loss
-        self.loss = self._to_numpy(loss)[0]
+        self._loss_tensor = loss_xyz + loss_v_xyz
+        self.loss = self._to_numpy(self._loss_tensor)
         return None
 
     def _calculate_gradient(self):
         """How might we change `composition` in order to improve `loss`?
         """
-        self._require('_composition_tensor', '_calculate_3d_field')
+        self._require('_composition_tensor', '_calculate_3d_raybundle_sequence')
         self._require('_loss_tensor', '_calculate_loss')
-        for c in self._composition_tensor:
-            if c.grad is not None:
-                c.grad.zero_()
+        composition_tensor = self._composition_tensor
+        # Zero out any existing gradients:
+        if composition_tensor.grad is not None:
+            composition_tensor.grad.zero_()
         self._loss_tensor.backward()
-        self._gradient_tensor = [c.grad for c in self._composition_tensor]
+        self._gradient_tensor = composition_tensor.grad
         return None
-
-    def _propagation_phase_mask(self, distance):
-        """For simulating propagation in homogenous materials
-
-        This is only used inside other private methods, so its
-        implemented in torch Tensors, not numpy arrays.
-        """
-        self._require('wavelength', 'set_2d_input_field')
-        # Local nicknames:
-        nx, ny, nz = self.coordinates.n_xyz
-        dx, dy, dz = self.coordinates.d_xyz
-        wavelength, d = self.wavelength, self.device
-        fftfreq, nan_to_num = torch.fft.fftfreq, torch.nan_to_num
-        pi, sqrt, exp, float64 = torch.pi, torch.sqrt, torch.exp, torch.float64
-        # Spatial frequencies as a function of position in FFT space:
-        k  = 2*pi / wavelength
-        kx = 2*pi * fftfreq(nx, dx, dtype=float64, device=d).reshape( 1, nx)
-        ky = 2*pi * fftfreq(ny, dy, dtype=float64, device=d).reshape(ny,  1)
-        # with np.errstate(invalid='ignore'): # I don't need this for torch?
-        kz = nan_to_num(sqrt(k**2 - kx**2 - ky**2))
-        phase_mask = exp(1j*kz*distance)
-        return phase_mask
-
-    def _apodization_amplitude_mask(self):
-        """For simulating propagation with non-periodic boundary conditions.
-
-        We want absorptive boundary conditions, not reflective or
-        periodic boundary conditions, so we smoothly reduce the
-        transmission amplitude near the lateral edges of the simulation
-        volume.
-
-        This is only used inside other private methods, so its
-        implemented in torch Tensors, not numpy arrays.
-        """
-        if not hasattr(self, '_apodization_edge_pixels'):
-            self._apodization_edge_pixels = 5
-        if not hasattr(self, '_apodization_edge_value'):
-            self._apodization_edge_value = 0.5
-        edge_pixels = int(self._apodization_edge_pixels)
-        edge_value = float(self._apodization_edge_value)
-        assert edge_pixels > 0
-        assert edge_value >= 0
-        assert edge_value <= 1
-        nx, ny, nz = self.coordinates.n_xyz
-        assert nx > 2*edge_pixels
-        assert ny > 2*edge_pixels
-        # Local nicknames:
-        ones, linspace, float64 = torch.ones, torch.linspace, torch.float64
-        def linear_taper(n):
-            mask = ones(n, dtype=float64, device=self.device)
-            mask[0:edge_pixels] = linspace(edge_value, 1, edge_pixels)
-            mask[-edge_pixels:] = linspace(1, edge_value, edge_pixels)
-            return mask
-        amplitude_mask = (linear_taper(nx).reshape(1, nx) *
-                          linear_taper(ny).reshape(ny, 1))
-        return amplitude_mask
 
     def _composition_to_refractive_index(self, composition):
         """Convert our `composition` tensor to refractive index at each voxel.
@@ -634,25 +565,23 @@ class Refractive3dOptic:
         refractive_index = index_1 + (index_2 - index_1)*concentration
                 
         return refractive_index # A pytorch Tensor (which allows autograd)
-
-    def _freespace_propagation(self, field, distance):
+    
+    def _composition_to_acceleration(self, composition):
+        """Convert our `composition` tensor  to ray 'acceleration' at each voxel.
         """
-        Like `_calculate_3d_propagation()`, but for a single step, with
-        no edge absorption and homogenous refractive index. We use this
-        internally to calculate the loss function.
-        """
-        nx, ny, nz = self.coordinates.n_xyz
-        assert field.shape == (ny, nx)
-        phase_mask = self._propagation_phase_mask(distance)
-        if isinstance(field, np.ndarray):     # Numpy input, return an array
-            assert np.iscomplexobj(field)
-            fft, ifft = np.fft.fftn, np.fft.ifftn
-            phase_mask = self._to_numpy(phase_mask)
-        elif isinstance(field, torch.Tensor): # Torch input, return a tensor
-            assert torch.is_complex(field)
-            fft, ifft = torch.fft.fftn, torch.fft.ifftn
-        field_after_propagation = ifft(phase_mask * fft(field))
-        return field_after_propagation
+        # `composition` must be a tensor, to allow autograd:
+        assert isinstance(composition, torch.Tensor) 
+        
+        coords = self.coordinates
+        dx, dy, dz = coords.d_xyz
+        
+        # The acceleration is proportional to (n - n_base):
+        refractive_index = self._composition_to_refractive_index(composition)
+        
+        dn_dxyz = torch.stack(torch.gradient(refractive_index, spacing=(dz, dy, dx)), axis=0)
+        acceleration = torch.flip(refractive_index * dn_dxyz, [0])    
+        
+        return acceleration # A pytorch Tensor (which allows autograd)
 
     def _invalidate(
         self,
@@ -690,10 +619,23 @@ class Refractive3dOptic:
         elif x.ndim == 3:
             return [torch.from_numpy(x[i, :, :]).to(self.device)
                     for i in range(x.shape[0])]
+            
+    def _to_3d_torch(self, x):
+        """Convert a 3D numpy array to a 3D torch tensor.
+        """
+        assert x.ndim == 3
+        return torch.from_numpy(x).to(self.device)
+    
+    def _to_torch_raybundle(self, raybundle):
+        """Convert a RayBundle with numpy arrays to one with torch tensors.
+        """
+        xyz_tensor   = self._to_torch(raybundle.xyz)
+        v_xyz_tensor = self._to_torch(raybundle.v_xyz)
+        return RayBundle(xyz_tensor, v_xyz_tensor)
 
     def _to_numpy(self, x):
-        if isinstance(x, torch.Tensor): # Convert directly to a 2D array
-            assert x.ndim in (1, 2)
+        if isinstance(x, torch.Tensor): # Convert directly to an array
+            assert x.ndim in (0, 1, 2, 3)
             return x.cpu().detach().numpy()
         elif isinstance(x, list): # Convert to a 3D numpy array
             # This is kinda janky but seems correct at least.
@@ -707,6 +649,15 @@ class Refractive3dOptic:
             return out
         else:
             assert type(x) in (torch.Tensor, list)
+            
+    def _to_numpy_raybundle(self, raybundle):
+        """Convert a RayBundle with torch tensors to one with numpy arrays.
+        """
+        if isinstance(raybundle, list):
+            return [self._to_numpy_raybundle(rb) for rb in raybundle]
+        xyz_array   = self._to_numpy(raybundle.xyz)
+        v_xyz_array = self._to_numpy(raybundle.v_xyz)
+        return RayBundle(xyz_array, v_xyz_array)
 
 def _to_concentration(composition):
     """See `set_3d_concentration` for details
@@ -733,65 +684,47 @@ def _to_composition(concentration):
     composition = tan(np.pi*(concentration - 0.5))
     return composition
 
-def _z_interpolate(known_values, known_z, desired_z):
-    """Interpolate a 3D stack in the z-direction.
+def interp(x, xp, fp, dim=-1):
+    """Linear interpolation of one dimension of an n-dimensional tensor.
+
+    See github.com/pytorch/pytorch/issues/50334#issuecomment-2304751532
     """
-    # 'known_values' is a 3D stack of 2D images, each taken at some
-    # fixed, known z-coordinate. At each xy position in 2D, we want to
-    # interpolate in the z-direction, to give a value at an unknown,
-    # intermediate z-coordinate:
-    assert known_values.ndim == 3
-    num_values, ny, nx = known_values.shape
-    num_intervals = num_values - 1
-    assert num_intervals >= 1
-    # 'known_z' is a 1D vector, giving the z-coordinate of each 2D image
-    # in 'known_values'. 'known_z' must be monotonic increasing, and
-    # uniformly spaced:
-    assert known_z.shape == (num_values,)
-    zi, zf = known_z[0], known_z[-1]
-    uniformly_spaced_values = torch.linspace(
-        zi, zf, num_values, device=known_z.device, dtype=known_z.dtype)
-    assert torch.allclose(known_z, uniformly_spaced_values)
-    # 'desired_z' is a 2D array, with the same dimensions as a single
-    # slice of 'known_values'. The entries in 'desired_z' are the
-    # (unknown) z-coordinates at which we want to estimate values via
-    # interpolation. All these z-values must be within the interval
-    # covered by 'known_z':
-    assert desired_z.shape == (ny, nx)
-    assert zi <= desired_z.min() 
-    assert desired_z.max() < zf
-    
-    desired_z_normalized = (desired_z - zi) * (num_intervals / (zf - zi))
-    which_interval = torch.floor(desired_z_normalized)
-    remainder = desired_z_normalized - which_interval
-    which_interval = which_interval.to(torch.int64).reshape(1, ny, nx)
+    # Move the interpolation dimension to the last axis
+    x  =  x.movedim(dim, -1).contiguous()
+    xp = xp.movedim(dim, -1).contiguous()
+    fp = fp.movedim(dim, -1).contiguous()
+    # Calculate slopes and offsets:
+    m = torch.diff(fp) / torch.diff(xp) # slope
+    b = fp[..., :-1] - m*xp[..., :-1] # offset
+    indices = torch.searchsorted(xp, x, right=False)
+    # Pad m and b to get constant values outside of xp range
+    m = torch.cat([torch.zeros_like(m)[..., :1], m,
+                   torch.zeros_like(m)[..., :1]], dim=-1)
+    b = torch.cat([fp[..., :1], b, fp[..., -1:]], dim=-1)
 
-    lo_bound_vals = torch.gather(known_values, 0, which_interval)
-    hi_bound_vals = torch.gather(known_values, 0, which_interval+1)
+    values = x*m.gather(-1, indices) + b.gather(-1, indices)
+    return values.movedim(-1, dim)
 
-    result = lo_bound_vals*(1-remainder) + hi_bound_vals*remainder
-    return result[0, :, :]
-
-def smooth_2d(a, sigma=5):
-    """Smooth a 2D torch tensor via convolution with a small Gaussian kernel
+def smooth_3d(a, sigma=5):
+    """Smooth a 3D torch tensor via convolution with a small Gaussian kernel
 
     Similar to scipy.ndimage.gaussian_filter(), but (potentially)faster via GPU.
     """
-    assert a.ndim == 2
+    assert a.ndim == 3
     assert isinstance(a, torch.Tensor)
     # Local nicknames:
-    arange, exp, conv2d = torch.arange, torch.exp, torch.nn.functional.conv2d
+    arange, exp, conv3d = torch.arange, torch.exp, torch.nn.functional.conv3d
     # Make a gaussian kernel:
     radius = int(4*sigma + 0.5)
     x = arange(-radius, radius+1, dtype=a.dtype, device=a.device)
     gaussian = exp((-0.5/sigma**2) * x**2)
     gaussian = gaussian / gaussian.sum()
-    # Use pytorch for 2d convolution.
-    # The shapes that conv2d expects are all minibatch-silly:
+    # Use pytorch for 3d convolution.
+    # The shapes that conv3d expects are all minibatch-silly:
     s0, s1 = a.shape, (1, 1) + a.shape
-    for s2 in ((1, 1, 1, len(x)), (1, 1, len(x), 1)):
-        # We use a pair of 2D convolutions with a pair of 1D kernels. Wheee!
-        a = conv2d(a.view(s1), gaussian.view(s2), padding='same')
+    for s2 in ((1, 1, 1, 1, len(x)), (1, 1, 1, len(x), 1), (1, 1, len(x), 1, 1)):
+        # We use a trio of 3D convolutions with a trio of 1D kernels. Wheee!
+        a = conv3d(a.view(s1), gaussian.view(s2), padding='same')
     return a.view(s0) # Clip off the silly extra dimensions.
 
 class SellmeierMaterial:
@@ -874,136 +807,15 @@ class Coordinates:
         self.n_xyz = nx, ny, nz
         self.nx, self.ny, self.nz = self.n_xyz
         return None
-
-class RefractiveOpticSequence:
-    def __init__(self, optics_list):
-        """Multiple Refractive3dOptics in a row.
-
-        The output field of the Nth Refractive3dOptic is the input field
-        to the N+1th Refractive3dOptic.
-
-        For example, you might want to simulate a big air gap in between
-        two 3D printed optics:
-        
-        air = FixedIndexMaterial(1)
-        polymer = FixedIndexMaterial(1.5)
-        coords = Coordinates(xyz_i=(-12.7, -12.7, -12.7),
-                             xyz_f=(+12.7, +12.7, +12.7),
-                             n_xyz=(  128,   128,   128))
-
-        printed_optic_1 = Refractive3dOptic(coords)
-        printed_optic_1.set_materials((air, polymer))
-
-        air_gap = Refractive3dOptic(coords)
-        air_gap.set_materials((air, air))
-        air_gap.allow_gradient_update = False
-
-        printed_optic_2 = Refractive3dOptic(coords)
-        printed_optic_2.set_materials((air, polymer))
-
-        my_optics = RefractiveOpticSequence((printed_optic_1,
-                                             air_gap,
-                                             printed_optic_2))
-        """
-        assert len(optics_list) > 0
-        for o in optics_list:
-            assert isinstance(o, Refractive3dOptic)
-            if not hasattr(o, 'allow_gradient_update'):
-                o.allow_gradient_update = True
-            assert o.allow_gradient_update in (True, False)
-        for o1, o2 in zip(optics_list[ :-1], optics_list[1:  ]):
-            # We don't check that the z-coordinates of our consecutive
-            # optics are consistent, but be thoughtful about the fact
-            # that the z-positions of the refractive voxels and the
-            # z-positions of the calculated field have a "fencepost"
-            # relationship:
-            #
-            # https://en.wikipedia.org/wiki/Off-by-one_error#Fencepost_error
-            #
-            # We *do* check that consecutive optics share XY coordinates:
-            c1, c2 = o1.coordinates, o2.coordinates
-            assert c1.nx == c2.nx # Consecutive optics have same # of x-pixels
-            assert c1.ny == c2.ny # Consecutive optics have same # of y-pixels
-            assert np.allclose(c1.x, c2.x) # Consecutive optics share x coords
-            assert np.allclose(c1.y, c2.y) # Consecutive optics share y coords
-        self.optics = optics_list
+    
+class RayBundle:
+    def __init__(self, xyz, v_xyz):
+        assert xyz.ndim     == 2
+        assert xyz.shape[1] == 3
+        assert v_xyz.shape  == xyz.shape
+        self.xyz   = xyz
+        self.v_xyz = v_xyz
         return None
-
-    def disable_gradient_update(self, optic):
-        """We might not want to optimize all of the optics in our sequence.
-        """
-        assert optic in self.optics
-        optic.allow_gradient_update = False
-        return None
-
-    def set_2d_input_field(self, input_field, wavelength):
-        """See `Refractive3dOptic.set_2d_input_field()` for details
-        """
-        first_optic, last_optic = self.optics[0], self.optics[-1]
-        first_optic.set_2d_input_field(input_field, wavelength)
-        last_optic.wavelength = wavelength
-        return None
-
-    def set_2d_desired_output_field(self, desired_output_field):
-        """See `Refractive3dOptic.set_2d_desired_output_field()` for details
-        """
-        # This will get overwritten, it's just to trigger input sanitization:
-        self.optics[-1].set_2d_desired_output_field(desired_output_field)
-        # This gets remembered, though:
-        self.desired_output_field = desired_output_field
-        return None
-
-    def gradient_update(self, step_size, z_planes=(1, 2, 3), smoothing_sigma=5):
-        """See `Refractive3dOptic.gradient_update()` for details
-        """
-        assert step_size > 0
-        assert smoothing_sigma >= 0
-        step_size = float(step_size)
-        smoothing_sigma = float(smoothing_sigma)
-        z_planes = [float(z) for z in z_planes]
-        
-        pairs_of_optics = zip(self.optics[:-1], self.optics[1:])
-        final_optic = self.optics[-1]
-        try:
-            for i, (current_optic, next_optic) in enumerate(pairs_of_optics):
-                # Calculate propagation through the current optic:
-                current_optic._calculate_3d_field()
-                # Use the output field of the current optic as the input
-                # field of the next optic:
-                next_optic.set_2d_input_field(
-                    input_field=current_optic._calculated_field_tensor[-1],
-                    wavelength=current_optic.wavelength)
-            # Calculate loss just for the final optic:
-            final_optic.set_2d_desired_output_field(self.desired_output_field)
-            delattr(self, 'desired_output_field')
-            final_optic._calculate_3d_field()
-            final_optic._calculate_loss(z_planes=z_planes)
-            self.loss = np.copy(final_optic.loss)
-            # Zero the gradient for all the optics:
-            for i, o in enumerate(self.optics):
-                for c in o._composition_tensor:
-                    if c.grad is not None:
-                        c.grad.zero_()
-            # Backpropagate to populate our gradients:
-            final_optic._loss_tensor.backward()
-            for i, o in enumerate(self.optics):
-                o._gradient_tensor = [c.grad for c in o._composition_tensor]
-            # Update our optics using our gradients:
-            for i, o in enumerate(self.optics):
-                for g, c in zip(o._gradient_tensor, o._composition_tensor):
-                    c.requires_grad_(False)
-                    if o.allow_gradient_update:
-                        update = step_size*smooth_2d(g, sigma=smoothing_sigma)
-                        c.subtract_(update)
-        except:
-            print("While calculating with optic %i, an exception occured:"%(i))
-            raise
-        
-        return None
-
-    def update_attributes(self, delete_tensors=True):
-        for op in self.optics:
-            op.update_attributes(delete_tensors=delete_tensors)
 
 ##############################################################################
 ## The following utility code is used for the demo in the 'main' block,
@@ -1032,18 +844,6 @@ def from_tif(filename):
     import tifffile as tf
     return tf.imread(output_directory() / filename)
 
-def attributes_to_tifs(refractive_optic_sequence, list_of_attributes):
-    assert isinstance(refractive_optic_sequence, RefractiveOpticSequence)
-    for n, optic in enumerate(refractive_optic_sequence.optics):
-        for i, attribute_name in enumerate(list_of_attributes):
-            if hasattr(optic, attribute_name):
-                attr = getattr(optic, attribute_name)
-                if np.iscomplexobj(attr):
-                    attr = np.abs(attr)
-                filename = "%02d_optic_%02d_%s.tif"%(
-                    i, n, attribute_name)
-                to_tif(filename, attr)
-
 def plot_loss_history(loss_history, filename):
     import matplotlib as mpl
     mpl.use('agg') # Prevents a memory leak from repeated plotting
@@ -1066,6 +866,52 @@ def plot_loss_history(loss_history, filename):
     plt.close(fig)
     return None
 
+def show_ray_diagram(coords, raybundle_array, filename):
+    assert isinstance(raybundle_array, list) and len(raybundle_array) > 0
+    assert all(isinstance(rb, RayBundle) for rb in raybundle_array)
+    assert isinstance(raybundle_array[0].xyz, np.ndarray)
+    x_i, x_f = coords.x_i, coords.x_f
+    z_i, z_f = coords.z_i, coords.z_f
+    Dx, Dz = x_f-x_i, z_f-z_i
+    extra_margin_x = 0.1
+    extra_margin_z = 0.15
+    import matplotlib.pyplot as plt
+    # Extract xyz positions from raybundle_array into shape (n_rays, n_z, 3)
+    xyz_vs_z = np.stack([rb.xyz for rb in raybundle_array], axis=1)
+    fig = plt.figure()
+    num_rays = xyz_vs_z.shape[0]
+    for which_ray in range(0, num_rays, 1+int(num_rays/100)):
+        z = xyz_vs_z[which_ray, :, 2]
+        x = xyz_vs_z[which_ray, :, 0]
+        plt.plot(z, x, '.-')
+    plt.grid('on')
+    plt.xlim((z_i-Dz*extra_margin_z, z_f+Dz*extra_margin_z))
+    plt.ylim((x_i-Dx*extra_margin_x, x_f+Dx*extra_margin_x))
+    plt.axvline(x=z_i, color='r', linestyle='--', linewidth=1)
+    plt.axvline(x=z_f, color='r', linestyle='--', linewidth=1)
+    plt.savefig(output_directory() / filename)
+    plt.close(fig)
+
+def show_ray_bundle(coords, raybundle, filename):
+    assert isinstance(coords, Coordinates)
+    assert isinstance(raybundle, RayBundle)
+    assert isinstance(raybundle.xyz, np.ndarray)
+    x_i, x_f = coords.x_i, coords.x_f
+    z_i, z_f = coords.z_i, coords.z_f
+    Dx, Dz = x_f-x_i, z_f-z_i
+    extra_margin_x = 0.1
+    extra_margin_z = 0.15
+    import matplotlib.pyplot as plt
+    fig = plt.figure()
+    plt.quiver(raybundle.xyz[:,2], raybundle.xyz[:,0], raybundle.v_xyz[:,2], raybundle.v_xyz[:,0], range(raybundle.xyz.shape[0]), angles='xy', units='height', width=0.005)
+    plt.grid('on')
+    plt.xlim((z_i-Dz*extra_margin_z, z_f+Dz*extra_margin_z))
+    plt.ylim((x_i-Dx*extra_margin_x, x_f+Dx*extra_margin_x))
+    plt.axvline(x=z_i, color='r', linestyle='--', linewidth=1)
+    plt.axvline(x=z_f, color='r', linestyle='--', linewidth=1)
+    plt.savefig(output_directory() / filename)
+    plt.close(fig)
+
 class TrainingData_for_2dImaging:
     """An example of how to generate training data for an imaging optic.
 
@@ -1076,7 +922,7 @@ class TrainingData_for_2dImaging:
     def __init__(self, coordinates, radius):
         assert isinstance(coordinates, Coordinates)
         self.coordinates = coordinates
-        assert radius > 0
+        assert radius >= 0
         self.radius = radius
         return None
 
@@ -1094,35 +940,44 @@ class TrainingData_for_2dImaging:
         x0,
         y0,
         wavelength,
+        num_thetas,
+        num_phis,
         divergence_angle_degrees,
-        phi=0,
-        theta=0,
         ):
         x0, y0 = float(x0), float(y0)
         wavelength = float(wavelength)
-        divergence_angle, pi = np.deg2rad(divergence_angle_degrees), np.pi
-        w = wavelength / (pi*divergence_angle)
+        zi, zf = self.coordinates.z_i, self.coordinates.z_f
+        num_rays = num_thetas * num_phis
         # Input beam is a focused point:
-        x, y, _ = self.coordinates.xyz
-        input_field = gaussian_beam_2d(
-            x=x, y=y, x0=x0, y0=y0, phi=phi, theta=theta,
-            wavelength=wavelength, w=w)
-        # Desired output beam is an inverted image of the same point:
-        desired_output_field = input_field[::-1, ::-1].copy()
-        return input_field, desired_output_field
-        
-def gaussian_beam_2d(x, y, x0, y0, phi, theta, wavelength, w):
-    # Local nicknames:
-    exp, sin, cos, pi = np.exp, np.sin, np.cos, np.pi
-    # Simple math:
-    k = 2*pi/wavelength
-    kx = k*sin(theta)*cos(phi)
-    ky = k*sin(theta)*sin(phi)
-    r_sq = (x-x0)**2 + (y-y0)**2
-    phase = exp(1j*(kx*(x-x0) + ky*(y-y0)))
-    amplitude = exp(-r_sq / w**2)
-    field = phase * amplitude
-    return field.squeeze()
+        xyz = np.zeros((num_rays, 3))
+        xyz[:, 0] = x0
+        xyz[:, 1] = y0
+        xyz[:, 2] = zi
+        #   Direction:
+        v_xyz = np.zeros((num_rays, 3))
+        # Higher density sampling for higher angles to provide uniform sampling by area
+        theta = np.deg2rad(divergence_angle_degrees*np.sqrt(np.random.random_sample(size=num_thetas)))
+        phi = np.deg2rad(np.random.uniform(0, 360, num_phis))
+        theta, phi = np.meshgrid(theta, phi, indexing='ij')
+        theta = theta.ravel()
+        phi = phi.ravel()
+        v_xyz[:, 0] = np.sin(theta) * np.cos(phi)
+        v_xyz[:, 1] = np.sin(theta) * np.sin(phi)
+        v_xyz[:, 2] = np.cos(theta)
+        input_raybundle = RayBundle(xyz, v_xyz)
+        # Desired output ray bundle is an inverted image of the same point:
+        out_xyz = np.zeros((num_rays, 3))
+        out_xyz[:, 0] = -x0
+        out_xyz[:, 1] = -y0
+        out_xyz[:, 2] = zf
+        out_v_xyz = np.zeros((num_rays, 3))
+        out_v_xyz[:, 0] = -v_xyz[:, 0]
+        out_v_xyz[:, 1] = -v_xyz[:, 1]
+        out_v_xyz[:, 2] = v_xyz[:, 2]
+        desired_output_raybundle = RayBundle(
+            xyz=np.copy(out_xyz), 
+            v_xyz=np.copy(out_v_xyz))
+        return input_raybundle, desired_output_raybundle
 
 if __name__ == '__main__':
     """Save our example code to disk, so you can execute it.
