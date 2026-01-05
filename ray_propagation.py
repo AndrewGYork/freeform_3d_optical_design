@@ -564,7 +564,7 @@ class Refractive3dOptic:
             xf_c, yf_c = z_propagate(calculated_rays, zf)
             distance_sq = (xf_d - xf_c)**2 + (yf_d - yf_c)**2
             loss += torch.mean(torch.sqrt(distance_sq))
-        loss = loss / (len(z_planes) + 1)
+        loss = loss / len(z_planes)
         # Save our results as attributes, not return values:
         self._loss_tensor = loss
         self.loss = self._to_numpy(loss)[0]
