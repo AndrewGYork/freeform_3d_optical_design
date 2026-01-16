@@ -94,19 +94,16 @@ def example_of_usage():
     # Make a source to generate training data. In this case, the
     # training data is for a simple plane-to-plane inverting imaging
     # system:
-    data_source = TrainingData_for_2dImaging(coords, radius=3)
-
-    wavelength = 0.5
-    cone_angle_degrees = 15
-    num_rays = 1000
+    data_source = TrainingData_for_2dImaging(
+        coords, radius=3, max_z_angle_deg=15, x0=0, y0=0, num_rays=1000)
     loss_history = []
     for iteration in range(int(1e6)): # Run for a loooong time
         start_time = time.perf_counter()
         
         # Use our data source to generate random input/output pairs:
-        x0, y0 = data_source.random_point_in_a_circle()
-        input_rays, desired_output_rays = data_source.input_output_pair(
-            x0, y0, wavelength, cone_angle_degrees, num_rays)
+        wavelength = 0.5
+        input_rays, desired_output_rays = (
+            data_source.input_output_pair(wavelength))
         ro.set_input_raybundle(input_rays)
         ro.set_desired_output_raybundle(desired_output_rays)
 
@@ -118,6 +115,7 @@ def example_of_usage():
             step_size=10,
             z_planes=(0, 1),
             smoothing_sigma=5)
+        x0, y0 = 0, 0 # TODO: remove this cruft
         loss_history.append((x0, y0, ro.loss))
 
         end_time = time.perf_counter()
@@ -1107,20 +1105,34 @@ def plot_simple_ray_diagram(refractive_object, filename):
     import matplotlib.pyplot as plt
 
     c = refractive_object.coordinates
-    raypaths = refractive_object.raypaths
-    x_vs_t = [r.x for r in raypaths]
-    y_vs_t = [r.y for r in raypaths]
-    z_vs_t = [r.z for r in raypaths]
 
+    raypaths = refractive_object.raypaths
+    num_rays = raypaths[0].xyz.shape[1]
+    max_plotted_rays = 300
+    chunk_size = int(np.ceil(num_rays / max_plotted_rays))
+
+    x_vs_t = [r.x[::chunk_size] for r in raypaths]
+    z_vs_t = [r.z[::chunk_size] for r in raypaths]
+
+    calculated_output = raypaths[-1]
+    desired_output = refractive_object.desired_output_raybundle
+    error_ray_x = np.stack((calculated_output.x[::chunk_size],
+                               desired_output.x[::chunk_size]))
+    error_ray_y = np.stack((calculated_output.y[::chunk_size],
+                               desired_output.y[::chunk_size]))
 
     fig = plt.figure()
-    plt.plot(z_vs_t, x_vs_t, '.-')
+    fig.add_subplot(1, 2, 1, adjustable='box', aspect=1)
+    plt.plot(z_vs_t, x_vs_t, '-', linewidth=0.5)
     plt.xlim(c.z_i, c.z_f)
     plt.ylim(c.x_i, c.x_f)
-##    plt.xlabel("Iteration")
-##    plt.ylabel("Loss")
     plt.grid('on', alpha=0.1)
-    plt.savefig(output_directory() / filename)
+    fig.add_subplot(1, 2, 2, adjustable='box', aspect=1)
+    plt.plot(error_ray_y, error_ray_x, '-', color='red', alpha=0.05)
+    plt.plot(error_ray_y, error_ray_x, '.', color='red', alpha=0.5,
+             markersize=2)
+    plt.grid('on', alpha=0.1)
+    plt.savefig(output_directory() / filename, dpi=2*fig.dpi)
     plt.close(fig)
     return None
 
@@ -1149,54 +1161,77 @@ def plot_loss_history(loss_history, filename):
 class TrainingData_for_2dImaging:
     """An example of how to generate training data for an imaging optic.
 
-    This generates input/output pairs that image a pointlike source at
-    the 2d input plane to an inverted (but otherwise identical) image of
-    the input plane to the output plane.
+    This generates input/output pairs that image rays at the 2d input
+    plane to an inverted (but otherwise identical) image of the input
+    plane to the output plane.
     """
-    def __init__(self, coordinates, radius):
+    def __init__(
+        self,
+        coordinates,
+        radius,
+        max_z_angle_deg,
+        x0, y0,
+        num_rays,
+        ):
         assert isinstance(coordinates, Coordinates)
         self.coordinates = coordinates
         assert radius > 0
-        self.radius = radius
+        self.radius = float(radius)
+        assert 0 <= max_z_angle_deg < 90
+        self.max_z_angle_deg = float(max_z_angle_deg)
+        self.x0, self.y0 = float(x0), float(y0)
+        self.z0 = float(self.coordinates.z_i)
+        assert num_rays > 0
+        self.num_rays = int(num_rays)
         return None
 
-    def random_point_in_a_circle(self):
+    def random_points_in_a_circle(self):
         # Local nicknames:
         R, sin, cos, pi, sqrt = self.radius, np.sin, np.cos, np.pi, np.sqrt
-        rand = np.random.random_sample
+        rand, n = np.random.random_sample, self.num_rays
         # Simple math:
-        r, phi = R*sqrt(rand()), 2*pi*rand()
-        x, y = r*cos(phi), r*sin(phi)
-        return x, y
+        r, phi = R*sqrt(rand(n)), 2*pi*rand(n)
+        xyz = np.empty((3, n), dtype='float64')
+        xyz[0, :] = self.x0 + r*cos(phi)
+        xyz[1, :] = self.y0 + r*sin(phi)
+        xyz[2, :] = self.z0
+        return xyz
 
-    def input_output_pair(
-        self,
-        x0,
-        y0,
-        wavelength,
-        cone_angle_degrees,
-        num_rays=100,
-        ):
+    def random_directions_in_a_cone(self):
+        th_max, pi, n = np.deg2rad(self.max_z_angle_deg), np.pi, self.num_rays
+        # Point-picking on a sphere is easy, but also easy to do wrong:
+        theta = np.arccos(np.random.uniform(np.cos(th_max), 1, n))
+        phi   =           np.random.uniform(0,           2*pi, n)
+        # Calculate our trig functions:
+        sin_th, cos_th = np.sin(theta), np.cos(theta)
+        sin_ph, cos_ph = np.sin(phi),   np.cos(phi)
+        # Convert back to Cartesian:
+        v_xyz = np.empty((3, n), dtype='float64')
+        v_xyz[0, :] = sin_th * cos_ph
+        v_xyz[1, :] = sin_th * sin_ph
+        v_xyz[2, :] = cos_th
+        return v_xyz        
+
+    def input_output_pair(self, wavelength_um):
         c = self.coordinates
-        x0, y0 = float(x0), float(y0)
-        wavelength = float(wavelength)
+        assert wavelength_um > 0
+        wavelength_um = float(wavelength_um)
         # Input beam is a focused point:
-        input_raybundle = random_conical_bundle(
-            x=x0, y=y0, z=c.z_i,
-            cone_angle=np.deg2rad(cone_angle_degrees),
-            num_rays=num_rays,
-            wavelength=wavelength)
-        # Desired output beam is an inverted image of the same point:
-        xyz   = input_raybundle.xyz.copy()
+        input_raybundle = RayBundle(
+            self.random_points_in_a_circle(),
+            self.random_directions_in_a_cone(),
+            wavelength_um)
+        # Desired output is an inverted image of the same points:
+        xyz = input_raybundle.xyz.copy()
         #  XY position flips, Z position is the output plane:
         xyz[0, :] = -1*xyz[0, :]
         xyz[1, :] = -1*xyz[1, :]
         xyz[2, :] = c.z_f
         #  XY velocity flips, Z velocity stays the same:
-        v_xyz   = input_raybundle.v_xyz.copy()
+        v_xyz = input_raybundle.v_xyz.copy()
         v_xyz[0, :] = -1*v_xyz[0, :]
         v_xyz[1, :] = -1*v_xyz[1, :]
-        desired_output_raybundle = RayBundle(xyz, v_xyz, wavelength)
+        desired_output_raybundle = RayBundle(xyz, v_xyz, wavelength_um)
         return input_raybundle, desired_output_raybundle
 
 def random_conical_bundle(
