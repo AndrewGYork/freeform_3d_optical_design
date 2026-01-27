@@ -496,11 +496,22 @@ class Refractive3dOptic:
         #   composition -> concentration -> index -> gradient -> acceleration
         # We ultimately want to update the 'composition', so track gradients:
         self._composition_tensor.requires_grad_(True)
-        n = self._composition_to_refractive_index(self._composition_tensor)
+        concentration = _to_concentration(self._composition_tensor)
+        n = self._concentration_to_refractive_index(concentration)
         dx, dy, dz = map(float, c.d_xyz) # torch.gradient is silly
         grad_z, grad_y, grad_x = torch.gradient(n, spacing=(dz, dy, dx))
         a_x, a_y, a_z = (n*grad_x, n*grad_y, n*grad_z)
-        del n, grad_x, grad_y, grad_z, dx, dy, dz
+        del concentration, grad_x, grad_y, grad_z, dx, dy, dz
+        # The 'speed' of our input RayBundle must equal the index of
+        # refraction that it starts in (see `set_input_raybundle()` for
+        # details). Keep the *direction* of our input ray velocities,
+        # but force the *magnitude* of our input ray velocities to equal
+        # the local index of refraction:
+        initial_index = sample_3d_grid_data_at_xyz(input_raybundle.xyz,
+                                                   n.detach(), c)
+        initial_speed = torch.sqrt((input_raybundle.v_xyz**2).sum(axis=0))
+        input_raybundle.v_xyz *= initial_index / initial_speed        
+        del n
         # We'll start by running a Runge-Kutta raytrace WITHOUT
         # automatic differentiation:
         rt = SharmaRaytracer(a_x.detach(), a_y.detach(), a_z.detach(), c)
@@ -580,21 +591,19 @@ class Refractive3dOptic:
         self._gradient_tensor = self._composition_tensor.grad
         return None
 
-    def _composition_to_refractive_index(self, composition):
-        """Convert our `composition` to refractive index at each voxel.
+    def _concentration_to_refractive_index(self, concentration):
+        """Convert our `concentration` to refractive index at each voxel.
 
         The propagation simulation wants to know the index at each voxel
-        due to our refractive optic, which depends on the `composition`
+        due to our refractive optic, which depends on the `concentration`
         at each voxel, and the materials that we're mixing.
         """
         # The index of refraction is a weighted average of our
         # materials. For now, we only implement binary mixtures:
-        concentration = _to_concentration(composition)
-        self.index_list = [m.get_index(self.input_raybundle.wavelength_um)
-                           for m in self.material_list]
-        assert len(self.index_list) == 2
-        index_1, index_2 = self.index_list
-        refractive_index = index_1 + (index_2 - index_1)*concentration                
+        assert len(self.material_list) == 2
+        index_1, index_2 = [m.get_index(self.input_raybundle.wavelength_um)
+                            for m in self.material_list]
+        refractive_index = index_1 + (index_2 - index_1)*concentration
         return refractive_index
 
     def _invalidate(self, iterable_of_attribute_names):
@@ -734,39 +743,14 @@ class SharmaRaytracer:
         # Make sure our coordinates object is a tensor on the right device:
         assert isinstance(coords, Coordinates)
         self.coordinates = coords.to('torch', device=a_x.device)
-        # Precalculate some simple variables we'll use for coordinate scaling:
-        c = self.coordinates
-        self.center_point = 0.5*(c.xyz_f + c.xyz_i).reshape(3, 1)
-        self.radius       = 0.5*(c.xyz_f - c.xyz_i).reshape(3, 1)
         return None
         
     def _get_acceleration(self, xyz):
         """Estimate acceleration at arbitrary xyz positions via interpolation.
-
-        Since we're a 'private' method, we don't bother with sanity
-        checks, but here's what they would be:
-        assert xyz.device   == self.a_x.device
-        assert xyz.ndim     == 2
-        assert xyz.shape[0] == 3
         """
-        c, a_x, a_y, a_z = self.coordinates, self.a_x, self.a_y, self.a_z
-        num_rays = xyz.shape[1]
-        # The 3D interpolation routine in torch wants xyz scaled to the
-        # range (-1, 1). This is a little silly, but whatever:
-        xyz_scaled = (xyz - self.center_point) * (1/self.radius)
-        # The 3D interpolation routine in torch wants `xyz` and
-        # `acceleration` to have a few extra dimensions that we're not
-        # using. This is a little silly, but whatever.
-        # (3, num_rays) -> (1, 1, 1, num_rays, 3)
-        xyz_scaled = xyz_scaled.reshape(3, 1, 1, num_rays, 1).transpose(0, 4)
-        # (nz, ny, nx) -> (1, 1, nz, ny, nx)
-        a_x = a_x.reshape((1, 1, c.nz, c.ny, c.nx))
-        a_y = a_y.reshape((1, 1, c.nz, c.ny, c.nx))
-        a_z = a_z.reshape((1, 1, c.nz, c.ny, c.nx))
-        # Now we can interpolate, and then strip off the extra dimensions:
-        a_x_i, a_y_i, a_z_i = [torch.nn.functional.grid_sample(
-            a, xyz_scaled, mode='bilinear', align_corners=True
-            ).reshape(num_rays) for a in (a_x, a_y, a_z)]
+        a_x_i, a_y_i, a_z_i = [
+            sample_3d_grid_data_at_xyz(xyz, a, self.coordinates)
+            for a in (self.a_x, self.a_y, self.a_z)]
         a_xyz = torch.stack((a_x_i, a_y_i, a_z_i), dim=0)
         return a_xyz
 
@@ -826,31 +810,71 @@ class SharmaRaytracer:
         #  Variables sampled uniformly in z:
         c_z = c.z.reshape(c.nz, 1, 1).broadcast_to((c.nz,) + rb.xyz.shape)
         z_vs_t = xyz_vs_t[:, 2:3, :].broadcast_to(xyz_vs_t.shape)
-        xyz_vs_z   = self.interp(x=c_z, xp=z_vs_t, fp=xyz_vs_t,   dim=0)
-        v_xyz_vs_z = self.interp(x=c_z, xp=z_vs_t, fp=v_xyz_vs_t, dim=0)
+        xyz_vs_z   = sample_1d_irregular_data(c_z, z_vs_t,   xyz_vs_t, dim=0)
+        v_xyz_vs_z = sample_1d_irregular_data(c_z, z_vs_t, v_xyz_vs_t, dim=0)
         return xyz_vs_z, v_xyz_vs_z
 
-    def interp(self, x, xp, fp, dim=-1):
-        """Linear interpolation of one dimension of an n-dimensional tensor.
+def sample_1d_irregular_data(new_positions, old_positions, old_values, dim=-1):
+    """Estimate values at arbitrary 1D positions via interpolation
 
-        See github.com/pytorch/pytorch/issues/50334#issuecomment-2304751532
-        """
-        # TODO: Is this actually any good? Can we do a lot better?
-        # Move the interpolation dimension to the last axis
-        x  =  x.movedim(dim, -1).contiguous()
-        xp = xp.movedim(dim, -1).contiguous()
-        fp = fp.movedim(dim, -1).contiguous()
-        # Calculate slopes and offsets:
-        m = torch.diff(fp) / torch.diff(xp) # slope
-        b = fp[..., :-1] - m*xp[..., :-1] # offset
-        indices = torch.searchsorted(xp, x, right=False)
-        # Pad m and b to get constant values outside of xp range
-        m = torch.cat([torch.zeros_like(m)[..., :1], m,
-                       torch.zeros_like(m)[..., :1]], dim=-1)
-        b = torch.cat([fp[..., :1], b, fp[..., -1:]], dim=-1)
+    Suppose we know the values of some 1D function sampled at known
+    positions in 1D. These values are stored in the 1D tensor
+    `old_values`, and their positions are stored in the 1D tensor
+    `old_positions`. We'd *like* to know values of this 1D function at
+    intermediate positions stored in the 1D tensor `new_positions`.
 
-        values = x*m.gather(-1, indices) + b.gather(-1, indices)
-        return values.movedim(-1, dim)
+    See github.com/pytorch/pytorch/issues/50334#issuecomment-2304751532
+    """
+    # TODO: Is this actually any good? Can we do a lot better?
+    # Move the interpolation dimension to the last axis
+    x  =  new_positions.movedim(dim, -1).contiguous()
+    xp =  old_positions.movedim(dim, -1).contiguous()
+    fp =     old_values.movedim(dim, -1).contiguous()
+    # Calculate slopes and offsets:
+    m = torch.diff(fp) / torch.diff(xp) # slope
+    b = fp[..., :-1] - m*xp[..., :-1] # offset
+    indices = torch.searchsorted(xp, x, right=False)
+    # Pad m and b to get constant values outside of xp range
+    m = torch.cat([torch.zeros_like(m)[..., :1], m,
+                   torch.zeros_like(m)[..., :1]], dim=-1)
+    b = torch.cat([fp[..., :1], b, fp[..., -1:]], dim=-1)
+
+    new_values = x*m.gather(-1, indices) + b.gather(-1, indices)
+    return new_values.movedim(-1, dim)
+
+def sample_3d_grid_data_at_xyz(xyz, data, data_coordinates):
+    """Estimate values at arbitrary 3D positions via interpolation.
+
+    Suppose we know the values of some 3D function sampled at points on
+    a regular 3D grid. These values are stored in the 3D tensor `a`, and
+    the coordinates are stored in the `Coordinates' object `a_coordinates`.
+    We'd *like* to know values of this 3D function at N intermediate
+    points, given by the coordinates stored in the (3, N) tensor `xyz`.
+    """
+    assert isinstance(xyz,  torch.Tensor)
+    assert isinstance(data, torch.Tensor)
+    assert isinstance(data_coordinates, Coordinates)
+    assert xyz.device == data.device == data_coordinates.device
+    assert xyz.ndim == 2
+    assert xyz.shape[0] == 3
+    c, num_points = data_coordinates, xyz.shape[1]
+    # The 3D interpolation routine in torch wants xyz scaled to the
+    # range (-1, 1). This is a little silly, but whatever:
+    center_point = 0.5*(c.xyz_f + c.xyz_i).reshape(3, 1)
+    radius       = 0.5*(c.xyz_f - c.xyz_i).reshape(3, 1)
+    xyz_scaled = (xyz - center_point) * (1/radius)
+    # The 3D interpolation routine in torch wants `xyz` and `a` to have
+    # a few extra dimensions that we're not using. This is a little
+    # silly, but whatever.
+    # (3, num_rays) -> (1, 1, 1, num_points, 3)
+    xyz_scaled = xyz_scaled.reshape(3, 1, 1, num_points, 1).transpose(0, 4)
+    # (nz, ny, nx) -> (1, 1, nz, ny, nx)
+    data = data.reshape((1, 1, c.nz, c.ny, c.nx))
+    # Now we can interpolate, and then strip off the extra dimensions:
+    data_estimated_at_xyz = torch.nn.functional.grid_sample(
+        data, xyz_scaled, mode='bilinear', align_corners=True
+        ).reshape(num_points)
+    return data_estimated_at_xyz
 
 class Coordinates:
     """A convenience class for keeping track of the coordinates of our voxels.
