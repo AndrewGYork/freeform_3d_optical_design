@@ -3,7 +3,7 @@ import torch # For calculating gradients
 import torch.nn.functional
 
 """
-v0.0.1
+v0.0.2
 
 Techniques for fabricating freeform 3D refractive optics are rapidly
 maturing. By 'freeform', I don't just mean the shape - I mean optics
