@@ -894,7 +894,7 @@ class Coordinates:
         nx, ny, nz = map(int,   n_xyz)
         assert array_type in ('numpy', 'torch')
         self.array_type = array_type
-        self.device = device
+        self.device = torch.device(device)
         if array_type == 'numpy':
             linspace = np.linspace
             def as_floats(a): return np.asarray(a, dtype='float64')
@@ -907,6 +907,7 @@ class Coordinates:
                 return torch.as_tensor(a, dtype=torch.float64, device=device)
             def as_ints(a):
                 return torch.as_tensor(a, dtype=torch.int32,   device=device)
+            self.device = linspace(0, 1, 2).device
         # - Initial and final voxel positions:
         self.xyz_i = as_floats(xyz_i)
         self.xyz_f = as_floats(xyz_f)
