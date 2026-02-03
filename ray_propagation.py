@@ -525,11 +525,13 @@ class Refractive3dOptic:
         for which_z in range(c.nz - 1): # Input/output planes are voxel centers
             rb = raypaths[-1]
             # Simple nearest-neighbor interpolation to get acceleration:
-            x_scaled = ((rb.x - c.x_i_edges)*(1/c.dx)).to(torch.int32)
-            y_scaled = ((rb.y - c.y_i_edges)*(1/c.dy)).to(torch.int32)
-            a_x_in = a_x[which_z][y_scaled, x_scaled]
-            a_y_in = a_y[which_z][y_scaled, x_scaled] # Interpolated values
-            a_z_in = a_z[which_z][y_scaled, x_scaled]
+            x_scaled = (rb.x - c.x_i_edges)*(1/c.dx)
+            y_scaled = (rb.y - c.y_i_edges)*(1/c.dy)
+            which_x = torch.clip(x_scaled, 0, c.nx-1).to(torch.int32)
+            which_y = torch.clip(y_scaled, 0, c.ny-1).to(torch.int32)
+            a_x_in = a_x[which_z][which_y, which_x]
+            a_y_in = a_y[which_z][which_y, which_x] # Interpolated values
+            a_z_in = a_z[which_z][which_y, which_x]
             a_xyz_i = torch.stack((a_x_in, a_y_in, a_z_in), dim=0)
             # Calculate the position/velocity update for Euler's method:
             dt = c.dz / rb.vz # Variable t-step to give constant z-step = dz.
