@@ -1173,7 +1173,12 @@ def plot_simple_ray_diagram(refractive_object, filename):
                                desired_output.x[::chunk_size]))
     error_ray_y = np.stack((calculated_output.y[::chunk_size],
                                desired_output.y[::chunk_size]))
-
+    error_ray_len = np.sqrt((error_ray_x[0, :] - error_ray_x[1, :])**2 +
+                            (error_ray_y[0, :] - error_ray_y[1, :])**2
+                            ).reshape(1, -1)
+    error_ray_len = np.clip(error_ray_len, 0, error_ray_len.mean())
+    error_ray_len = np.broadcast_to(error_ray_len, error_ray_x.shape)
+    
     fig = plt.figure()
     fig.add_subplot(1, 2, 1, adjustable='box', aspect=1)
     plt.plot(z_vs_t, x_vs_t, '-', linewidth=0.5)
@@ -1181,9 +1186,10 @@ def plot_simple_ray_diagram(refractive_object, filename):
     plt.ylim(c.x_i, c.x_f)
     plt.grid('on', alpha=0.1)
     fig.add_subplot(1, 2, 2, adjustable='box', aspect=1)
-    plt.plot(error_ray_y, error_ray_x, '-', color='red', alpha=0.05)
-    plt.plot(error_ray_y, error_ray_x, '.', color='red', alpha=0.5,
-             markersize=2)
+    plt.plot(error_ray_y, error_ray_x, '-', color='black', alpha=0.05)
+    plt.scatter(error_ray_y, error_ray_x, c=error_ray_len,
+                marker='.', cmap='viridis', alpha=0.5, s=2)
+    plt.colorbar(shrink=0.5, label='error')
     plt.grid('on', alpha=0.1)
     plt.savefig(output_directory() / filename, dpi=2*fig.dpi)
     plt.close(fig)
