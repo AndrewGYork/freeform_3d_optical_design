@@ -3,7 +3,7 @@ import torch # For calculating gradients
 import torch.nn.functional
 
 """
-v0.0.2
+v0.0.3
 
 Techniques for fabricating freeform 3D refractive optics are rapidly
 maturing. By 'freeform', I don't just mean the shape - I mean optics
@@ -244,7 +244,7 @@ class Refractive3dOptic:
         for m in material_list:
             assert hasattr(m, 'get_index')
         self.material_list = material_list
-        self._invalidate(('raypaths',    '_raypaths_tensor'
+        self._invalidate(('raypaths',    '_raypaths_tensor',
                           'loss',        '_loss_tensor',
                           'gradient',    '_gradient_tensor'))
         return None
@@ -271,7 +271,7 @@ class Refractive3dOptic:
         assert np.isrealobj(concentration)
         self.concentration = concentration.astype('float64', copy=True)
         self._invalidate(('composition', '_composition_tensor',
-                          'raypaths',    '_raypaths_tensor'
+                          'raypaths',    '_raypaths_tensor',
                           'loss',        '_loss_tensor',
                           'gradient',    '_gradient_tensor'))
         return None
@@ -327,7 +327,7 @@ class Refractive3dOptic:
             print("Hopefully you know what you're doing!")
         self.input_raybundle = input_raybundle
         self._invalidate(('desired_output_raybundle',
-                          'raypaths', '_raypaths_tensor'
+                          'raypaths', '_raypaths_tensor',
                           'loss',     '_loss_tensor',
                           'gradient', '_gradient_tensor'))
         return None
@@ -517,6 +517,12 @@ class Refractive3dOptic:
         rt = SharmaRaytracer(a_x.detach(), a_y.detach(), a_z.detach(), c)
         xyz_vs_z_RK, v_xyz_vs_z_RK = rt.propagate_rays(input_raybundle, dt)
         del rt
+        # Clip rays that exit through the edges:
+        xyz_i, xyz_f = c.xyz_i_edges.reshape(3, 1), c.xyz_f_edges.reshape(3, 1)
+        xyz_min, xyz_max = xyz_vs_z_RK.amin(axis=0), xyz_vs_z_RK.amax(axis=0)
+        in_bounds = (xyz_i <= xyz_min) & (xyz_max <= xyz_f)
+        in_bounds = torch.all(in_bounds, dim=0)
+        self._in_bounds = in_bounds # The loss function will need this
         # Now run an Euler's method raytrace WITH automatic differentiation:
         a_x = torch.unbind(a_x, dim=0)
         a_y = torch.unbind(a_y, dim=0) # We only touch one 2D slice at a time
@@ -524,11 +530,15 @@ class Refractive3dOptic:
         raypaths = [input_raybundle]
         for which_z in range(c.nz - 1): # Input/output planes are voxel centers
             rb = raypaths[-1]
-            # Simple nearest-neighbor interpolation to get acceleration:
-            x_scaled = (rb.x - c.x_i_edges)*(1/c.dx)
-            y_scaled = (rb.y - c.y_i_edges)*(1/c.dy)
-            which_x = torch.clip(x_scaled, 0, c.nx-1).to(torch.int32)
-            which_y = torch.clip(y_scaled, 0, c.ny-1).to(torch.int32)
+            # Simple nearest-neighbor interpolation to get acceleration.
+            # Note that out-of-bound rays don't contribute to the loss
+            # or the gradient, and their trajectories are still pinned
+            # by the Runge-Kutta solver, so it doesn't matter what value
+            # we use here for out-of-bounds acceleration:
+            which_x = ((rb.x - c.x_i_edges)*(1/c.dx)).to(torch.int32)
+            which_y = ((rb.y - c.y_i_edges)*(1/c.dy)).to(torch.int32)
+            which_x = torch.clip(which_x, 0, c.nx-1) # Handle out-of-bound rays
+            which_y = torch.clip(which_y, 0, c.ny-1)
             a_x_in = a_x[which_z][which_y, which_x]
             a_y_in = a_y[which_z][which_y, which_x] # Interpolated values
             a_z_in = a_z[which_z][which_y, which_x]
@@ -563,16 +573,23 @@ class Refractive3dOptic:
         self._require('desired_output_raybundle',
                       'set_desired_output_raybundle')
         self._require('_raypaths_tensor', '_calculate_3d_propagation')
-        desired_rays = self.desired_output_raybundle.to('torch', self.device)
-        calculated_rays = self._raypaths_tensor[-1] # The output raybundle
+        desired_rb = self.desired_output_raybundle.to('torch', self.device)
+        calculated_rb = self._raypaths_tensor[-1] # The output raybundle
+        # Clip rays that exit through the edges:
+        desired_rb    = RayBundle(  xyz=desired_rb.xyz[  :, self._in_bounds],
+                                  v_xyz=desired_rb.v_xyz[:, self._in_bounds],
+                                  wavelength_um=desired_rb.wavelength_um)
+        calculated_rb = RayBundle(  xyz=calculated_rb.xyz[  :, self._in_bounds],
+                                  v_xyz=calculated_rb.v_xyz[:, self._in_bounds],
+                                  wavelength_um=calculated_rb.wavelength_um)
         def z_propagate(rb, z): # Propagate a raybundle to a given z-plane
             if z == 0: return rb.x, rb.y # Don't bother
             dt = (z - rb.z) / rb.vz # Each ray takes a different amount of time
             return rb.x + dt*rb.vx, rb.y + dt*rb.vy # x_final, y_final
         loss = torch.zeros(1, device=self.device, dtype=torch.float64)
         for zf in z_planes:
-            xf_d, yf_d = z_propagate(   desired_rays, zf)
-            xf_c, yf_c = z_propagate(calculated_rays, zf)
+            xf_d, yf_d = z_propagate(   desired_rb, zf)
+            xf_c, yf_c = z_propagate(calculated_rb, zf)
             distance_sq = (xf_d - xf_c)**2 + (yf_d - yf_c)**2
             loss += torch.mean(torch.sqrt(distance_sq))
         loss = loss / len(z_planes)
@@ -789,12 +806,14 @@ class SharmaRaytracer:
 
         # Call '_step_rays()' in a loop... 
         raybundle_sequence = [initial_raybundle]
+        xyz_i, xyz_f = c.xyz_i_edges.reshape(3, 1), c.xyz_f_edges.reshape(3, 1)
         for which_step in range(max_steps):
             rb = raybundle_sequence[-1]
-            z_min = rb.xyz[2, :].min()
-            # ...until our rays pass z = z_f:
-            if (z_min - c.z_f)*c.dz > 0: # Trying to account for z_f < z_i
-                break
+            # ...until our rays all exit the volume:
+            if which_step % 10 == 0: # Don't bother checking every step
+                out_of_bounds = (rb.xyz < xyz_i) | (xyz_f < rb.xyz)
+                all_out_of_bounds = torch.all(torch.any(out_of_bounds, dim=0))
+                if all_out_of_bounds: break
             next_rb = self._step_rays(rb, dt)
             raybundle_sequence.append(next_rb)
         else:
@@ -874,7 +893,8 @@ def sample_3d_grid_data_at_xyz(xyz, data, data_coordinates):
     data = data.reshape((1, 1, c.nz, c.ny, c.nx))
     # Now we can interpolate, and then strip off the extra dimensions:
     data_estimated_at_xyz = torch.nn.functional.grid_sample(
-        data, xyz_scaled, mode='bilinear', align_corners=True
+        data,
+        xyz_scaled, mode='bilinear', align_corners=True, padding_mode='zeros',
         ).reshape(num_points)
     return data_estimated_at_xyz
 
@@ -893,7 +913,13 @@ class Coordinates:
         # - Inputs:
         xi, yi, zi = map(float, xyz_i)
         xf, yf, zf = map(float, xyz_f)
+        assert xi < xf
+        assert yi < yf
+        assert zi < zf
         nx, ny, nz = map(int,   n_xyz)
+        assert nx > 1
+        assert ny > 1
+        assert nz > 1
         assert array_type in ('numpy', 'torch')
         self.array_type = array_type
         self.device = torch.device(device)
