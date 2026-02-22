@@ -582,14 +582,15 @@ class Refractive3dOptic:
         calculated_rb = RayBundle(  xyz=calculated_rb.xyz[  :, self._in_bounds],
                                   v_xyz=calculated_rb.v_xyz[:, self._in_bounds],
                                   wavelength_um=calculated_rb.wavelength_um)
-        def z_propagate(rb, z): # Propagate a raybundle to a given z-plane
-            if z == 0: return rb.x, rb.y # Don't bother
-            dt = (z - rb.z) / rb.vz # Each ray takes a different amount of time
+        def z_propagate(rb, z_offset): # Propagate a raybundle by z-offset
+            if z_offset == 0: return rb.x, rb.y # Don't bother
+            # Each ray takes a different amount of time:
+            dt = (z_offset - (rb.z - self.coordinates.z_f)) / rb.vz 
             return rb.x + dt*rb.vx, rb.y + dt*rb.vy # x_final, y_final
         loss = torch.zeros(1, device=self.device, dtype=torch.float64)
-        for zf in z_planes:
-            xf_d, yf_d = z_propagate(   desired_rb, zf)
-            xf_c, yf_c = z_propagate(calculated_rb, zf)
+        for z_offset in z_planes:
+            xf_d, yf_d = z_propagate(   desired_rb, z_offset)
+            xf_c, yf_c = z_propagate(calculated_rb, z_offset)
             distance_sq = (xf_d - xf_c)**2 + (yf_d - yf_c)**2
             loss += torch.mean(torch.sqrt(distance_sq))
         loss = loss / len(z_planes)
