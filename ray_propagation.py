@@ -3,7 +3,7 @@ import torch # For calculating gradients
 import torch.nn.functional
 
 """
-v0.0.3
+v0.0.4
 
 Techniques for fabricating freeform 3D refractive optics are rapidly
 maturing. By 'freeform', I don't just mean the shape - I mean optics
@@ -80,7 +80,9 @@ def example_of_usage():
     # Each voxel of our refractive optic is a mixture of materials:
     air     = FixedIndexMaterial(1)
     polymer = FixedIndexMaterial(1.5)
-    ro.set_materials((air, polymer))
+    ro.set_materials(input_material=air,
+                     mixture_materials_list=(air, polymer),
+                     output_material=air)
 
     # Initialize our optic.
     try: # If there's a concentration saved to disk, pick up where we left off:
@@ -180,6 +182,10 @@ class RayBundle:
         assert self.wavelength_um > 0
         return None
 
+    def get_speed(self):
+        sqrt = np.sqrt if isinstance(self.v_xyz, np.ndarray) else torch.sqrt
+        return sqrt(self.v_xyz**2).sum(axis=0)
+
     def to(self, array_type, device='cpu'):
         """Return a copy of this RayBundle, as either torch or numpy."""
         assert array_type in ('numpy', 'torch')
@@ -212,7 +218,10 @@ class Refractive3dOptic:
         self.set_3d_concentration()
         return None
 
-    def set_materials(self, material_list):
+    def set_materials(self,
+                      input_material,
+                      mixture_materials_list,
+                      output_material):
         """What materials are we mixing to control the index of refraction?
 
         The index of refraction at each voxel is the weighted average of
@@ -240,10 +249,14 @@ class Refractive3dOptic:
             material_list = [air, fused_silica]
         """
         # For now, we only allow binary mixtures:
-        assert len(material_list) == 2
-        for m in material_list:
+        assert hasattr(input_material, 'get_index')
+        assert len(mixture_materials_list) == 2
+        for m in mixture_materials_list:
             assert hasattr(m, 'get_index')
-        self.material_list = material_list
+        assert hasattr(output_material, 'get_index')
+        self.input_material = input_material
+        self.material_list = mixture_materials_list
+        self.output_material = output_material
         self._invalidate(('raypaths',    '_raypaths_tensor',
                           'loss',        '_loss_tensor',
                           'gradient',    '_gradient_tensor'))
@@ -309,10 +322,14 @@ class Refractive3dOptic:
         SellmeierMaterial, then the units of this `wavelength` need to
         be microns.
         """
+        self._require('input_material', 'set_materials')
         self._require('material_list', 'set_materials')
         assert isinstance(input_raybundle, RayBundle)
         wavelength_um = input_raybundle.wavelength_um
-        warning_string = ("""
+        # Force the input speed to match the input index:
+        input_index = self.input_material.get_index(wavelength_um)
+        input_raybundle.v_xyz *= input_index / input_raybundle.get_speed()
+        wavelength_warning_string = ("""
     You're using a SellmeierMaterial, which expects the units of
     wavelength to be in microns, but your specified wavelength (%0.2f)
     seems to be outside the visible spectrum. Hopefully you know what
@@ -320,7 +337,7 @@ class Refractive3dOptic:
         if any([isinstance(m, SellmeierMaterial) for m in self.material_list]):
             if wavelength_um < 0.3 or 0.9 < wavelength_um:
                 if not hasattr(self, '_SellmeierMaterial_warning'):
-                    print(warning_string)
+                    print(wavelength_warning_string)
                     self._SellmeierMaterial_warning = True
         if not np.allclose(input_raybundle.z, self.coordinates.z_i):
             print("WARNING: your input raybundle isn't in the input z-plane.")
@@ -344,11 +361,17 @@ class Refractive3dOptic:
         output.
         """
         self._require('input_raybundle', 'set_input_raybundle')
+        self._require('output_material', 'set_materials')
         assert isinstance(desired_output_raybundle, RayBundle)
         assert (desired_output_raybundle.xyz.shape ==
                     self.input_raybundle.xyz.shape)
-        desired_output_raybundle.wavelength_um = ( # Float equality is annoying!
-            self.input_raybundle.wavelength_um)    # Just force them equal.
+        wavelength_um = self.input_raybundle.wavelength_um
+        # Force the output wavelength to match the input wavelength:
+        desired_output_raybundle.wavelength_um = wavelength_um
+        # Force the output speed to match the output index:
+        output_index = self.output_material.get_index(wavelength_um)
+        desired_output_raybundle.v_xyz *= (output_index /
+                                           desired_output_raybundle.get_speed())
         self.desired_output_raybundle = desired_output_raybundle
         self._invalidate(('loss', '_loss_tensor',
                           'gradient', '_gradient_tensor'))
@@ -485,7 +508,9 @@ class Refractive3dOptic:
         self._require('material_list', 'set_materials')
         # All the internal work of this function is done in torch. Convert:
         c = self.coordinates.to('torch', self.device)
-        input_raybundle = self.input_raybundle.to('torch', self.device)
+        input_rb = self.input_raybundle.to('torch', self.device)
+        output_index = self.output_material.get_index(input_rb.wavelength_um)
+        output_index = self._to_torch(output_index)
         if not hasattr(self, '_composition_tensor'):
             self._composition_tensor = _to_composition(
                 self._to_torch(self.concentration))
@@ -502,20 +527,18 @@ class Refractive3dOptic:
         grad_z, grad_y, grad_x = torch.gradient(n, spacing=(dz, dy, dx))
         a_x, a_y, a_z = (n*grad_x, n*grad_y, n*grad_z)
         del concentration, grad_x, grad_y, grad_z, dx, dy, dz
-        # The 'speed' of our input RayBundle must equal the index of
-        # refraction that it starts in (see `set_input_raybundle()` for
-        # details). Keep the *direction* of our input ray velocities,
-        # but force the *magnitude* of our input ray velocities to equal
-        # the local index of refraction:
-        initial_index = sample_3d_grid_data_at_xyz(input_raybundle.xyz,
-                                                   n.detach(), c)
-        initial_speed = torch.sqrt((input_raybundle.v_xyz**2).sum(axis=0))
-        input_raybundle.v_xyz *= initial_index / initial_speed        
-        del n
+        # Our input rays will (generally) refract at the input surface.
+        # This is just Snell's law. Note it can produce NaNs, which
+        # correspond to en.wikipedia.org/wiki/Total_internal_reflection
+        internal_index = sample_3d_grid_data_at_xyz(input_rb.xyz, n.detach(), c)
+        input_rb.vz[:] = torch.sqrt(internal_index**2
+                                     - input_rb.vx**2
+                                     - input_rb.vy**2)
+        del internal_index
         # We'll start by running a Runge-Kutta raytrace WITHOUT
         # automatic differentiation:
         rt = SharmaRaytracer(a_x.detach(), a_y.detach(), a_z.detach(), c)
-        xyz_vs_z_RK, v_xyz_vs_z_RK = rt.propagate_rays(input_raybundle, dt)
+        xyz_vs_z_RK, v_xyz_vs_z_RK = rt.propagate_rays(input_rb, dt)
         del rt
         # Clip rays that exit through the edges:
         xyz_i, xyz_f = c.xyz_i_edges.reshape(3, 1), c.xyz_f_edges.reshape(3, 1)
@@ -527,7 +550,7 @@ class Refractive3dOptic:
         a_x = torch.unbind(a_x, dim=0)
         a_y = torch.unbind(a_y, dim=0) # We only touch one 2D slice at a time
         a_z = torch.unbind(a_z, dim=0)
-        raypaths = [input_raybundle]
+        raypaths = [input_rb]
         for which_z in range(c.nz - 1): # Input/output planes are voxel centers
             rb = raypaths[-1]
             # Simple nearest-neighbor interpolation to get acceleration.
@@ -557,6 +580,11 @@ class Refractive3dOptic:
             v_xyz_f.subtract_(v_xyz_error)
             rb = RayBundle(xyz_f, v_xyz_f, wavelength_um=rb.wavelength_um)
             raypaths.append(rb)
+        # Our rays will also refract at the output surface:
+        vz = torch.sqrt(output_index**2 - rb.vx**2 - rb.vy**2)
+        output_rb = RayBundle(xyz_f, torch.stack((rb.vx, rb.vy, vz)),
+                              wavelength_um=rb.wavelength_um)
+        raypaths.append(output_rb)
         self._raypaths_tensor = raypaths
         self._invalidate(('raypaths', 'loss', '_loss_tensor',
                           'gradient', '_gradient_tensor'))
