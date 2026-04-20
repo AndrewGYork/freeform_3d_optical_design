@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: freeform-3d-optical-design
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE.txt
+Requires-Dist: matplotlib>=3.10.5
+Requires-Dist: napari>=0.6.4
+Requires-Dist: ndv>=0.4.0
+Requires-Dist: numpy>=2.3.2
+Requires-Dist: pyqt5>=5.15.11
+Requires-Dist: pyside6>=6.9.1
+Requires-Dist: qtpy>=2.4.3
+Requires-Dist: scipy>=1.16.1
+Requires-Dist: tifffile>=2025.6.11
+Requires-Dist: torch>=2.8.0
+Dynamic: license-file
+
+# freeform_3d_optical_design
+
+Forked Repo for CZ Hackathon

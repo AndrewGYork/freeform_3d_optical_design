@@ -1,0 +1,32 @@
+why is the phase output desired vs calculated so different:
+
+
+The reason the two images look so different is due to a phenomenon called phase wrapping.
+
+The optimizer has correctly learned how to create the vortex, but it has done so by creating a lens that is much thicker than it needs to be. The result is physically correct, but the visualization makes it look different.
+
+The Desired Phase vs. The Calculated Phase
+
+Desired Phase (Your First Image): This is the "perfect" or "ideal" phase profile for a vortex. It's a smooth, continuous ramp from -π to +π. This is the simplest mathematical representation of the phase twist you want.
+
+Calculated Phase (Your Second Image): This is the phase profile of a focusing lens, also known as a Fresnel zone plate. The concentric rings are the signature of a lens that bends light.
+
+Why This is the Correct Answer
+
+The simulation's goal is to match the output beam, not necessarily the phase profile in the most direct way possible. It has correctly figured out that to turn a wide input beam into a slightly smaller output vortex, it needs to both twist the phase and focus the beam.
+
+The concentric rings you see are the focusing part of the solution. The underlying vortex twist is still there, but it's now combined with this powerful focusing effect.
+
+The "Phase Wrapping" Analogy 🕒
+
+Imagine you want to tell someone to turn a knob by 90 degrees. You could just say "turn it 90 degrees."
+
+But you could also say "turn it 450 degrees" (360 + 90). The final position of the knob would be exactly the same.
+
+This is what's happening with the phase.
+
+The desired phase is like saying "turn it 90 degrees."
+
+The calculated phase is like saying "turn it 450 degrees." The optimizer has found a solution that adds extra multiples of 360 degrees (or 2π in radians) to the phase.
+
+When you visualize the phase, the program can only show values between -180 and +180 degrees (-π to +π). So, when the phase goes past 180, it "wraps around" back to -180, creating the sharp edges you see in the rings.

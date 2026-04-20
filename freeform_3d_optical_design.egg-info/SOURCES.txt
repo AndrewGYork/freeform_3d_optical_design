@@ -1,0 +1,17 @@
+LICENSE.txt
+README.md
+pyproject.toml
+./gui/__init__.py
+./gui/main.py
+./gui/visdata.py
+./gui/watcher.py
+freeform_3d_optical_design.egg-info/PKG-INFO
+freeform_3d_optical_design.egg-info/SOURCES.txt
+freeform_3d_optical_design.egg-info/dependency_links.txt
+freeform_3d_optical_design.egg-info/entry_points.txt
+freeform_3d_optical_design.egg-info/requires.txt
+freeform_3d_optical_design.egg-info/top_level.txt
+gui/__init__.py
+gui/main.py
+gui/visdata.py
+gui/watcher.py

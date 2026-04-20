@@ -1,6 +1,6 @@
 import numpy as np
-from beam_propagation import Coordinates, BeamPropagation, gaussian_beam_2d
-from beam_propagation import to_tif, from_tif, plot_loss_history, smooth
+from train_multiscale.beam_propagation_multiscale import Coordinates, BeamPropagation, gaussian_beam_2d
+from train_multiscale.beam_propagation_multiscale import to_tif, from_tif, plot_loss_history, smooth
 
 """
 Design a 3D refractive optic that mimics the input/output behavior of an

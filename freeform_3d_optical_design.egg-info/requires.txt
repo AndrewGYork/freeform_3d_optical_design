@@ -1,0 +1,10 @@
+matplotlib>=3.10.5
+napari>=0.6.4
+ndv>=0.4.0
+numpy>=2.3.2
+pyqt5>=5.15.11
+pyside6>=6.9.1
+qtpy>=2.4.3
+scipy>=1.16.1
+tifffile>=2025.6.11
+torch>=2.8.0

@@ -1,0 +1,13 @@
+Pixel Size = Physical Width / Grid Resolution
+
+n2 5-stage grids
+
+Stage 1 (128x128): 25.4 µm / 128 pixels ≈ 0.20 µm/pixel
+
+Stage 2 (256x256): 63.8 µm / 256 pixels ≈ 0.25 µm/pixel
+
+Stage 3 (512x512): 159.4 µm / 512 pixels ≈ 0.31 µm/pixel
+
+Stage 4 (1024x1024): 399.0 µm / 1024 pixels ≈ 0.39 µm/pixel
+
+Stage 5 (2048x2048): 1000.0 µm / 2048 pixels ≈ 0.49 µm/pixel
